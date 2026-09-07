@@ -153,7 +153,7 @@ New-Item -ItemType Directory -Path $LocalBin -Force | Out-Null
 # refers to these rather than re-testing $IsWindows inline, so the
 # platform differences are visible in one block instead of scattered
 # through six steps.
-$RawBase     = "https://raw.githubusercontent.com/AviMehandru/yt-dlp-download-automator/main"
+$RawBase     = "https://raw.githubusercontent.com/AviMehandru/orchid-ochre/main"
 $DownloadDir = Join-Path $SourceDir "YT-DLP Installation Files"
 $ScriptsDir  = Join-Path $DataRoot "scripts"
 $ConfigsDir  = Join-Path $DataRoot "configs"

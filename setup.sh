@@ -743,7 +743,7 @@ do
 done
 
 if [ -z "$COMMON_PS1" ]; then
-    COMMON_URL="https://raw.githubusercontent.com/AviMehandru/yt-dlp-download-automator/main/scripts/setup-common.ps1"
+    COMMON_URL="https://raw.githubusercontent.com/AviMehandru/orchid-ochre/main/scripts/setup-common.ps1"
     COMMON_PS1="$(mktemp -t setup-common.XXXXXX.ps1 2>/dev/null || echo /tmp/setup-common.$$.ps1)"
     echo "Fetching the shared installer half from ${COMMON_URL}"
     if ! curl -fsSL --retry 3 --retry-delay 2 -o "$COMMON_PS1" "$COMMON_URL"; then

@@ -320,7 +320,7 @@ foreach ($candidate in @(
 }
 
 if (-not $CommonPs1) {
-    $commonUrl = "https://raw.githubusercontent.com/AviMehandru/yt-dlp-download-automator/main/scripts/setup-common.ps1"
+    $commonUrl = "https://raw.githubusercontent.com/AviMehandru/orchid-ochre/main/scripts/setup-common.ps1"
     $CommonPs1 = Join-Path $env:TEMP "setup-common.ps1"
     Write-Host "Fetching the shared installer half from $commonUrl"
     try {

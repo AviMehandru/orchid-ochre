@@ -2,7 +2,7 @@
 # VIEWER_VERSION: 1
 """
 archive-viewer.py -- a local, dependency-free viewer for the archive produced
-by the yt-dlp-download-automator pipeline.
+by the orchid-ochre pipeline.
 
 The pipeline already saves everything worth keeping (video, subtitles,
 thumbnail, description, chapters, the full info.json *including the merged

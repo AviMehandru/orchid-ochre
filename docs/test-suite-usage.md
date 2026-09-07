@@ -104,7 +104,7 @@ The edit-then-reinstall loop is only needed when you want to use the change
 for a real download.
 
 ```bash
-cd ~/Documents/repos/yt-dlp-download-automator
+cd ~/Documents/repos/orchid-ochre
 $EDITOR scripts/postprocess.ps1
 ./tests/run-tests -Suite '05*'          # seconds, against the file you just saved
 ```
