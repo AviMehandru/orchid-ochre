@@ -109,6 +109,37 @@
       --no-audio        Alias for --mode video-only.
       --no-video        Alias for --mode audio-only.
 
+    Asking instead of downloading:
+
+      --probe           Do not download anything. Print ONE JSON document
+                        on stdout describing what the URL actually is:
+                        title, uploader, duration, thumbnail, the real
+                        format table (with this script's own --codec /
+                        --audio-codec / --container vocabulary already
+                        derived from it), and, for a playlist or channel,
+                        the list of entries with their 1-based positions.
+
+                        The point is that every question a frontend has to
+                        answer before it can offer a sensible Quality menu
+                        -- does this video have 1440p, does it have AV1,
+                        can it be merged into mp4 -- is answered ONCE, by
+                        the pipeline, rather than four times by four
+                        consumers each running `yt-dlp -J` and each
+                        mapping its codec spellings onto these flags
+                        slightly differently.
+
+                        Nothing is written: no archive, no session log, no
+                        Archive History snapshot. --items narrows which
+                        playlist entries are enumerated, and --no-pot /
+                        --pot-port still apply because the PO token
+                        provider changes which formats yt-dlp can see. The
+                        options that describe a download (--path, --sync,
+                        --after, --lazy, --workers, --mode, --quality,
+                        --codec, --audio-codec, --container, the --no-*
+                        skips) are refused rather than ignored -- a probe
+                        that silently dropped --quality would read as
+                        though it had honoured it.
+
     The escape hatch:
 
       --ytdlp-arg ARG   Pass ARG straight to yt-dlp, after the config file
@@ -194,6 +225,7 @@ Usage: ytdl <youtube-url> [download-root-path] [options]
   Skips:     [--no-comments] [--no-subs] [--no-thumbnail] [--no-metadata]
              [--no-audio] [--no-video]
   Escape:    [--ytdlp-arg ARG]   (repeatable)
+  Ask only:  [--probe]           (prints JSON, downloads nothing)
 "@
 
 $argList = @($args)
@@ -211,7 +243,7 @@ if ($argList.Count -eq 0 -or [string]::IsNullOrWhiteSpace($argList[0])) {
 $knownOptions = @("--sync", "--items", "--after", "--lazy", "--workers", "--path", "--no-pot", "--skip-pot-update", "--pot-port",
                   "--mode", "--quality", "--codec", "--audio-codec", "--container",
                   "--no-comments", "--no-subs", "--no-thumbnail", "--no-metadata", "--no-audio", "--no-video",
-                  "--ytdlp-arg")
+                  "--ytdlp-arg", "--probe")
 
 # The accepted values for the four enumerated content options. Validated
 # HERE, at the point the user typed them, rather than left to
@@ -329,6 +361,7 @@ $noMetadata      = $false
 $noAudio         = $false
 $noVideo         = $false
 $ytdlpArgs       = @()
+$probe           = $false
 
 # Backward compatibility with the old positional form: if the first
 # remaining argument does not start with "--", treat it as the legacy
@@ -477,6 +510,12 @@ while ($i -lt $rest.Count) {
             $i += 2
         }
 
+        # --- Ask instead of download ---
+        "--probe" {
+            $probe = $true
+            $i++
+        }
+
         default {
             Write-Usage "Unknown option: $($rest[$i])`n$usage"
             exit 1
@@ -543,6 +582,64 @@ if ($mode -eq "subs-only" -and $noSubs) {
 if ($audioCodec -and $audioCodec -ne "any" -and $mode -ne "audio-only") {
     Write-Usage "Warning: --audio-codec only applies to --mode audio-only; ignoring it for this run."
     $audioCodec = ""
+}
+
+# --- --probe goes somewhere else entirely ---
+#
+# A probe is a different program with a different contract: it reads, it
+# prints JSON to stdout, and it writes nothing. Dispatching to a separate
+# script rather than adding a -Probe switch to run_ytdlp.ps1 is deliberate
+# -- run_ytdlp.ps1 self-heals the folder tree, opens a session log and
+# snapshots Archive History long before it reaches anything that could
+# short-circuit, and a query that leaves those side effects behind is not
+# the read-only thing the frontends were promised.
+#
+# The refusals below are the other half of that contract. Every option in
+# the list describes what a DOWNLOAD should do, and a probe cannot honour
+# any of them; accepting and ignoring one would produce a preview that
+# looks like it reflects the user's settings and does not.
+if ($probe) {
+    $downloadOnlyOpts = @()
+    if ($customPath)      { $downloadOnlyOpts += "--path" }
+    if ($breakOnExisting) { $downloadOnlyOpts += "--sync" }
+    if ($dateAfter)       { $downloadOnlyOpts += "--after" }
+    if ($lazyPlaylist)    { $downloadOnlyOpts += "--lazy" }
+    if ($workers)         { $downloadOnlyOpts += "--workers" }
+    # Named as the user typed them. By this point the alias resolution
+    # above has already folded --no-audio/--no-video into $mode, so
+    # reporting "--mode" for a command line that never contained it would
+    # send someone looking for an option they did not type.
+    if ($noAudio)         { $downloadOnlyOpts += "--no-audio" }
+    elseif ($noVideo)     { $downloadOnlyOpts += "--no-video" }
+    elseif ($mode)        { $downloadOnlyOpts += "--mode" }
+    if ($quality)         { $downloadOnlyOpts += "--quality" }
+    if ($codec)           { $downloadOnlyOpts += "--codec" }
+    if ($audioCodec)      { $downloadOnlyOpts += "--audio-codec" }
+    if ($container)       { $downloadOnlyOpts += "--container" }
+    if ($noComments)      { $downloadOnlyOpts += "--no-comments" }
+    if ($noSubs)          { $downloadOnlyOpts += "--no-subs" }
+    if ($noThumbnail)     { $downloadOnlyOpts += "--no-thumbnail" }
+    if ($noMetadata)      { $downloadOnlyOpts += "--no-metadata" }
+    if ($downloadOnlyOpts.Count -gt 0) {
+        Write-Usage "Error: --probe downloads nothing, so $($downloadOnlyOpts -join ', ') cannot apply. Probe the URL first, then run it with the options you want."
+        exit 1
+    }
+
+    # --skip-pot-update is not in the refusal list because the probe always
+    # behaves as though it were given: a question must not install a
+    # provider as a side effect. Accepting it as a harmless no-op is
+    # friendlier than refusing a flag that asks for what already happens.
+    $probeArgs = @("-NoProfile", "-File", (Join-Path $installRoot "scripts/probe.ps1"), "-Url", $url)
+    if ($playlistItems) { $probeArgs += @("-PlaylistItems", $playlistItems) }
+    if ($noPot)         { $probeArgs += "-NoPot" }
+    if ($potPort)       { $probeArgs += @("-PotPort", $potPort) }
+    if ($ytdlpArgs.Count -gt 0) {
+        $probeJson = ConvertTo-Json -Compress -InputObject @($ytdlpArgs)
+        $probeArgs += @("-YtdlpArgsB64",
+                        [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($probeJson)))
+    }
+    & pwsh @probeArgs
+    exit $LASTEXITCODE
 }
 
 # Assembled as an argument ARRAY rather than a command string, so a path or

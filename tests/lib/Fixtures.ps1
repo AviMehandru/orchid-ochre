@@ -125,6 +125,7 @@ function Install-PipelineInto {
         'scripts/run_ytdlp.ps1'     = 'scripts/run_ytdlp.ps1'
         'scripts/postprocess.ps1'   = 'scripts/postprocess.ps1'
         'scripts/ytdl.ps1'          = 'scripts/ytdl.ps1'
+        'scripts/probe.ps1'         = 'scripts/probe.ps1'
         'scripts/archive-viewer.py' = 'scripts/archive-viewer.py'
         'config/yt-dlp.conf'        = 'configs/yt-dlp.conf'
     }

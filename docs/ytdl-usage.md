@@ -399,6 +399,70 @@ Arguments that decide **where** files are written are refused:
 you a differently-configured archive — it gives you files no consumer of the
 archive can find, with no error at any layer. The run stops instead.
 
+## Asking instead of downloading
+
+### `--probe`
+
+Downloads nothing. Prints **one JSON document on stdout** describing what the
+URL actually is, and exits.
+
+```bash
+ytdl "https://youtu.be/VIDEOID" --probe
+ytdl "https://www.youtube.com/playlist?list=PLID" --probe --items 1-50
+```
+
+What comes back: title, uploader, duration, thumbnail, upload date, view and
+comment counts, the availability and live status — and the **real format
+table**, with this pipeline's own `--codec`, `--audio-codec` and `--container`
+vocabulary already derived from it. For a playlist or channel, the entry list
+with each entry's 1-based playlist position, which is exactly what `--items`
+counts.
+
+The full field list is `docs/probe-contract.md`. That file is a **contract**
+in the same sense `docs/archive-layout.md` is: it is read by consumers in
+other repositories, it carries a version number, and a field removed or
+redefined without a bump breaks them silently.
+
+**Why this exists.** Every frontend of this project needs the same three
+answers before it can offer a sensible menu — does this video have 1440p, does
+it have AV1, can it be merged into mp4 — and each of them could get those by
+running `yt-dlp -J` itself. Four of them doing that separately means four
+mappings from yt-dlp's codec spellings (`vp09.00.50.08`, `av01.0.12M.08`,
+`mp4a.40.2`) onto the three or four values these flags accept, and four
+opinions about which containers a merge can produce. The last one is the one
+that bites: offering `mp4` for an Opus-only video produces a re-encode or a
+failed merge depending on yt-dlp version, and the user finds out afterwards.
+So the derivation is here, once, with the test suite behind it.
+
+**What it does not do.** It does not write to the archive: no folder
+self-heal, no session log, no Archive History snapshot, no `archive.txt`. It
+also does not read `config/yt-dlp.conf` — it passes `--ignore-config` and
+builds its own short argument list, because the conf opens with `--update`
+(a frontend probing as you type would self-update yt-dlp per URL), its `-o`
+templates describe a download, and its retry tuning is set for a job worth
+waiting an hour for rather than one a person is watching.
+
+What it *does* share with a real run is the PO token provider, and therefore
+the player clients yt-dlp extracts with — because a probe on default clients
+reports a thinner format table than the download will actually get, which
+would make the preview lie in the one direction a preview must not. The
+provider is never *installed* by a probe, though: `--skip-pot-update` is
+always in effect. When there is no healthy provider the `pot` object in the
+output says so, in words.
+
+Flags that still apply: `--items` (narrows which entries are enumerated),
+`--no-pot` and `--pot-port` (they change which formats are visible), and
+`--ytdlp-arg` — which is how a URL needing `--cookies-from-browser` gets
+probed at all. Everything that describes a download (`--path`, `--sync`,
+`--after`, `--lazy`, `--workers`, `--mode`, `--quality`, `--codec`,
+`--audio-codec`, `--container`, the four `--no-*` skips) is **refused**, not
+ignored: a probe that silently dropped `--quality` would read as though it had
+honoured it.
+
+On failure, nothing goes to stdout and the message goes to stderr with a
+non-zero exit — so "did the probe work" is answered by "did I get parseable
+JSON", which is the test every consumer applies.
+
 ### Combinations that are refused
 
 Each of these would otherwise run to completion and produce nothing, or

@@ -404,6 +404,7 @@ $ProjectFiles = @(
     "scripts/run_ytdlp.ps1",
     "scripts/postprocess.ps1",
     "scripts/ytdl.ps1",
+    "scripts/probe.ps1",
     "scripts/pot-provider.ps1",
     "scripts/archive-viewer.py",
     "config/yt-dlp.conf",
@@ -510,6 +511,14 @@ Install-ProjectFile -RepoPath "scripts/postprocess.ps1"   -Destination (Join-Pat
 # than in $LocalBin because it is a program, not a command -- ytdl-view
 # below is what you type.
 Install-ProjectFile -RepoPath "scripts/ytdl.ps1"          -Destination (Join-Path $ScriptsDir "ytdl.ps1")          -Label "ytdl.ps1"
+# probe.ps1 is `ytdl --probe`: the read-only half, launched by ytdl.ps1 as
+# its own process the same way run_ytdlp.ps1 is. No launcher and no PATH
+# entry -- there is no `ytdl-probe` command and there should not be, since
+# the probe is a mode of `ytdl`, not a second tool. Adding it needs no new
+# installer STEP: a file folds into Step 10's $ProjectFiles and this step's
+# calls, and only a new phase of work would earn an increment of
+# TOTAL_STEPS.
+Install-ProjectFile -RepoPath "scripts/probe.ps1"         -Destination (Join-Path $ScriptsDir "probe.ps1")         -Label "probe.ps1"
 # pot-provider.ps1 is dot-sourced by run_ytdlp.ps1 rather than launched, so
 # it needs no PATH entry and no launcher -- but it must land in the same
 # ScriptsDir, because that is the only place run_ytdlp.ps1 looks for it.
