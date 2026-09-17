@@ -178,6 +178,31 @@ param(
     [Parameter(Mandatory = $false)][switch]$NoThumbnail,
     [Parameter(Mandatory = $false)][switch]$NoMetadata,
 
+    # --- Re-fetching a component into a video that is already archived ---
+    # Valid only with -Mode metadata-only, comments-only or subs-only;
+    # re-validated below rather than trusted from ytdl.ps1, because this
+    # script is documented as directly invocable and CLAUDE.md's manual
+    # repair path uses it that way.
+    #
+    # Two things change, and they are in different files:
+    #
+    #   HERE, --download-archive is omitted from the yt-dlp invocation for
+    #   this session only. That is the whole reason --mode comments-only
+    #   could not reach an archived video before: yt-dlp skips any id
+    #   already in archive.txt, and every refresh target is such an id.
+    #   Omitting the flag (rather than pointing it at a scratch copy, which
+    #   is what the degraded path does) is deliberate -- a refresh
+    #   downloads no media, so there is no new archive line it could
+    #   legitimately produce, and the real archive.txt is left untouched.
+    #
+    #   IN postprocess.ps1, -Refresh makes the manifest MERGE instead of
+    #   being rewritten: the prior download_mode and media_file are carried
+    #   over and the refresh is appended to refresh_history. Without that,
+    #   refreshing a full video's comments would relabel its folder
+    #   comments-only with media_file = null, and every reader of this
+    #   archive would believe it.
+    [Parameter(Mandatory = $false)][switch]$Refresh,
+
     # Base64-encoded JSON array of raw yt-dlp arguments, decoded below.
     # Encoded rather than passed as a [string[]] because `pwsh -File`
     # cannot bind an array at all -- see the long note at the bottom of
@@ -686,7 +711,13 @@ if ($NoPot) {
 $refetchFile   = Join-Path $logsDir "needs-refetch.txt"
 $archiveForRun = $archiveFile
 $archiveScratch = $null
-if ($potDegraded) {
+# -Refresh is excluded from the whole degraded apparatus, not just from its
+# reconciliation: it downloads no media, so it can add nothing to
+# archive.txt and can therefore owe no re-fetch. Guarded here, at the one
+# place the scratch copy is created, so the diff, the needs-refetch write
+# and the cleanup below all fall away together rather than each needing
+# their own -not $Refresh.
+if ($potDegraded -and -not $Refresh) {
     $archiveScratch = Join-Path $logsDir ".archive-degraded-$timestamp.txt"
     if (Test-Path $archiveFile) {
         Copy-Item -Path $archiveFile -Destination $archiveScratch -Force
@@ -696,6 +727,39 @@ if ($potDegraded) {
     $archiveForRun = $archiveScratch
     "  Degraded session: downloads will NOT be recorded in archive.txt. Any video completed now is listed in $refetchFile for re-fetching at full quality later." |
         Tee-Object -FilePath $logFile -Append
+}
+
+# --- The archive argument itself, or nothing at all under -Refresh ---
+# Splatted into both yt-dlp invocations below rather than written out at
+# each call site, for the same reason $contentArgs is: the single-stream
+# and parallel paths diverging on one of these is the specific bug this
+# file's layout is arranged to prevent, and an empty array splats to
+# nothing.
+#
+# A refresh passes NO --download-archive at all, which is a different
+# answer from the degraded path's scratch copy above and deliberately so:
+#
+#   Degraded  wants yt-dlp to READ the archive (so a degraded session does
+#             not re-download the back catalogue) but not to WRITE to it.
+#             A scratch copy is the only way to get that, since yt-dlp has
+#             no read-only archive mode.
+#   Refresh   wants the opposite of the read: the whole point is to reach
+#             a video BECAUSE it is already in there. And it has nothing
+#             legitimate to write -- no media is downloaded, so no new
+#             archive line belongs to this session. Omitting the flag gets
+#             both halves and leaves archive.txt byte-for-byte untouched.
+#
+# The two can co-occur (a refresh during a degraded session). Refresh wins,
+# and that is correct rather than merely simpler: the scratch copy exists
+# to catch ids this session added, and a refresh adds none.
+$archiveArgs = if ($Refresh) { @() } else { @("--download-archive", $archiveForRun) }
+if ($Refresh) {
+    "Refresh session: --mode $Mode re-fetched into the existing video folder. archive.txt is neither consulted nor written this run, and the previous manifest's download_mode and media_file are preserved." |
+        Tee-Object -FilePath $logFile -Append
+    if ($potDegraded) {
+        "  NOTE: this refresh is also a degraded session. No re-fetch list is produced, because a refresh downloads no media and so adds nothing to archive.txt that could need replacing." |
+            Tee-Object -FilePath $logFile -Append
+    }
 }
 
 # =====================================================================
@@ -763,6 +827,27 @@ if ($YtdlpArgsB64) {
 
 $noMediaModes = @("metadata-only", "comments-only", "subs-only")
 $isNoMedia    = $noMediaModes -contains $Mode
+
+# --- -Refresh's contract, re-checked here ---
+# ytdl.ps1 already refuses both of these and names the option the user
+# typed, which is the better error and the one nearly everybody will see.
+# This copy exists because run_ytdlp.ps1 is documented as directly
+# invocable (CLAUDE.md's manual repair path calls it that way), and a
+# -Refresh that silently did nothing in full mode -- or that stopped at the
+# first archived video under -BreakOnExisting and logged a clean summary --
+# is exactly the quiet wrong result this pipeline is built to refuse.
+if ($Refresh) {
+    if (-not $isNoMedia) {
+        "ERROR: -Refresh requires -Mode $($noMediaModes -join ', ') -- it merges a re-fetched component into an existing video folder, and -Mode $Mode would download media into it instead." |
+            Tee-Object -FilePath $logFile -Append
+        exit 2
+    }
+    if ($BreakOnExisting) {
+        "ERROR: -Refresh and -BreakOnExisting contradict each other: every video -Refresh can reach is already in archive.txt, which is where -BreakOnExisting stops." |
+            Tee-Object -FilePath $logFile -Append
+        exit 2
+    }
+}
 
 # --- The media file's base name ---
 # "Final Video" for everything that has a video stream, "Final Audio" for
@@ -870,6 +955,31 @@ if ($isNoMedia) {
     }
 }
 
+# --- Refresh needs the sidecars REPLACED, not preserved ---
+# config/yt-dlp.conf carries --no-overwrites, which is exactly right for a
+# download: a re-run must never clobber a file that is already correct.
+# It is exactly wrong for a refresh, and in a way that fails silently and
+# completely rather than partially.
+#
+# Against a folder that already exists, --no-overwrites makes yt-dlp print
+# "Video metadata is already present" and skip the info.json -- so the file
+# is never moved into place, so --exec after_move never fires, so
+# postprocess.ps1 never runs. The session ends with a clean log, exit code
+# 0, and nothing whatsoever changed. That is the single worst shape a
+# failure can take in this pipeline, and it is the reason --refresh needed
+# a pipeline change rather than a button in the apps.
+#
+# --force-overwrites is safe HERE specifically because a refresh is always
+# a no-media mode: --skip-download means the only files yt-dlp can write
+# are the info.json, the description, the subtitles and the thumbnail --
+# every one of which is a thing the refresh was asked to replace. The
+# media file is not among them, and postprocess.ps1's own merge is what
+# protects the manifest.
+$refreshArgs = @()
+if ($Refresh) {
+    $refreshArgs = @("--force-overwrites")
+}
+
 # --- The output template for audio-only ---
 # Read out of the conf and rewritten, rather than duplicated here. The
 # per-video folder shape (uploader/date/id/title, and which subfolder each
@@ -922,6 +1032,7 @@ $contentArgs += $audioArgs
 $contentArgs += $containerArgs
 $contentArgs += $skipArgs
 $contentArgs += $skipDownloadArgs
+$contentArgs += $refreshArgs
 $contentArgs += $outputArgs
 $contentArgs += $passthroughArgs
 
@@ -945,6 +1056,7 @@ $runSettings = [ordered]@{
     no_subs       = [bool]$NoSubs
     no_thumbnail  = [bool]$NoThumbnail
     no_metadata   = [bool]$NoMetadata
+    refresh       = [bool]$Refresh
     passthrough   = @($passthroughArgs)
     effective_args = @($contentArgs)
 }
@@ -956,6 +1068,7 @@ $runSettingsB64 = [System.Convert]::ToBase64String(
 # --exec strings below cannot drift apart.
 $ppExtraArgs = "-Mode `"$Mode`" -RunSettingsB64 `"$runSettingsB64`""
 if ($NoComments) { $ppExtraArgs += " -NoComments" }
+if ($Refresh)    { $ppExtraArgs += " -Refresh" }
 
 # =====================================================================
 # END CONTENT SELECTION
@@ -1035,14 +1148,15 @@ if ($Workers -le 1) {
     # Quoting the URL is the only cure for those, so ytdl.ps1 detects what
     # it can of the aftermath and says so plainly, and docs/ytdl-usage.md
     # spells out the rule.
-    # $archiveForRun is the real archive.txt in a healthy session and a
-    # throwaway copy in a degraded one -- see DEGRADED-MODE ARCHIVE
-    # HANDLING above. @potArgs is empty in a degraded session, which makes
-    # this invocation identical to the pre-PO-token one.
+    # @archiveArgs names the real archive.txt in a healthy session, a
+    # throwaway copy in a degraded one, and NOTHING in a refresh -- see
+    # DEGRADED-MODE ARCHIVE HANDLING above for all three. @potArgs is empty
+    # in a degraded session, which makes this invocation identical to the
+    # pre-PO-token one.
     & yt-dlp `
         --ignore-config `
         --config-location $confFile `
-        --download-archive $archiveForRun `
+        @archiveArgs `
         --paths "home:$completeArchiveDir" `
         --paths "temp:$incompleteDir" `
         @jsRuntimeArgs `
@@ -1208,7 +1322,14 @@ if ($Workers -le 1) {
             # they would race to start, health-check and possibly rebuild
             # the same single provider server on the same single port.
             # The server is shared infrastructure; the args are just data.
-            $archiveForRun = $using:archiveForRun
+            #
+            # $archiveArgs rather than $archiveForRun: the decision about
+            # whether this session writes to archive.txt, to a scratch
+            # copy, or to nothing at all is a session-wide one made once in
+            # the parent, and what crosses the boundary is the finished
+            # argument array -- the same rule as $potArgs and $contentArgs,
+            # for the same reason.
+            $archiveArgs   = $using:archiveArgs
             $potArgs       = $using:potArgs
             $completeArchiveDir = $using:completeArchiveDir
             $incompleteDir = $using:incompleteDir
@@ -1244,7 +1365,7 @@ if ($Workers -le 1) {
             & yt-dlp `
                 --ignore-config `
                 --config-location $confFile `
-                --download-archive $archiveForRun `
+                @archiveArgs `
                 --paths "home:$completeArchiveDir" `
                 --paths "temp:$incompleteDir" `
                 @jsRuntimeArgs `

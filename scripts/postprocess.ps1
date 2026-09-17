@@ -36,6 +36,28 @@ param(
     # hour on comments" is a full-mode run.
     [Parameter(Mandatory = $false)][switch]$NoComments,
 
+    # This invocation is re-fetching one component into a video folder that
+    # ALREADY EXISTS, rather than assembling a new one. Only ever set
+    # alongside a no-media -Mode; run_ytdlp.ps1 refuses the other
+    # combinations before it can reach here.
+    #
+    # What it changes is the manifest, and getting this wrong would be
+    # silent and would propagate to every reader of the archive. In a
+    # no-media mode the manifest is ordinarily written with
+    # download_mode = that mode and media_file = $null, which is exactly
+    # right for a folder THAT MODE CREATED. Applied to a folder that
+    # already holds a full video it is a lie: the video is still there on
+    # disk, and the manifest -- which docs/archive-layout.md tells
+    # consumers to prefer over globbing -- now says there is no media.
+    #
+    # So under -Refresh the previous manifest's download_mode and
+    # media_file are carried over verbatim, and what this run did is
+    # recorded in refresh_history instead. The rest of the manifest is
+    # rewritten as usual, because the rest of it IS newly true: the
+    # comment audit, the file list, the hashes and the subtitle languages
+    # all describe the folder as it stands after this pass.
+    [Parameter(Mandatory = $false)][switch]$Refresh,
+
     # Base64-encoded JSON of the settings run_ytdlp.ps1 resolved for this
     # session, recorded verbatim into manifest.json. See the
     # run_settings field in docs/archive-layout.md for why the config
@@ -300,6 +322,56 @@ try {
     # Every step below that touches media is guarded on this being non-null
     # rather than on $FilePath's extension.
     $mediaFilePath = if ($isNoMedia) { $null } else { $FilePath }
+
+    # --- What was here before this run (refresh only) ---
+    # Read BEFORE anything in this script writes, because the thing being
+    # read is the file this script is about to overwrite.
+    #
+    # $priorManifest is $null in an ordinary run and stays $null on a
+    # refresh whose folder has no readable manifest -- which is a real
+    # state, not a bug: a folder written before layout 2, or one whose
+    # manifest was lost, can still be refreshed. The merge below degrades
+    # to "write the manifest as this mode normally would", which is the
+    # best statement available when the previous one cannot be read, and it
+    # is logged rather than left silent.
+    #
+    # $refreshMediaPath is the media file this folder ALREADY holds,
+    # resolved from the prior manifest's media_file. Deliberately NOT
+    # folded into $mediaFilePath: that variable means "the media file this
+    # run produced", and every step keyed off it -- the pre-merge stream
+    # relocation, the Final Video repository sync -- must stay off in a
+    # refresh, because this run produced nothing. The one step that does
+    # want the existing file is the info.json re-embed, and it asks for it
+    # by name.
+    $priorManifest   = $null
+    $refreshMediaPath = $null
+    if ($Refresh) {
+        $priorManifestPath = Join-Path $videoMetaDir "manifest.json"
+        if (Test-Path $priorManifestPath) {
+            try {
+                $priorManifest = Get-Content $priorManifestPath -Raw | ConvertFrom-Json
+            } catch {
+                Log "WARNING: --refresh could not read the existing manifest.json ($($_.Exception.Message)). It will be rewritten as a $Mode manifest, which means this folder will lose its record of the mode that originally wrote it."
+            }
+        } else {
+            Log "NOTE: --refresh found no existing manifest.json in this folder. Writing a $Mode manifest, as a non-refresh run would."
+        }
+
+        if ($priorManifest -and $priorManifest.media_file) {
+            # Resolved back through the SAME '/'-separated, folder-relative
+            # form the manifest stores, then existence-checked: a manifest
+            # can name a media file that has since been moved or deleted,
+            # and carrying the name forward while skipping the re-embed is
+            # the honest handling of that.
+            $candidate = Join-Path $videoDir ($priorManifest.media_file -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+            if (Test-Path $candidate) {
+                $refreshMediaPath = $candidate
+                Log "Refresh: this folder already holds $($priorManifest.media_file) (download_mode '$($priorManifest.download_mode)'), which will be preserved."
+            } else {
+                Log "WARNING: --refresh: the manifest names media_file '$($priorManifest.media_file)' but no such file is here. The name is preserved in the manifest; the info.json re-embed is skipped."
+            }
+        }
+    }
 
     try {
         $preMergePattern = "^{0}\.f\S+\." -f [regex]::Escape($mediaBaseName)
@@ -822,15 +894,31 @@ try {
     # copy lives in every case anyway -- the embed is a convenience, not
     # the system of record. Logged explicitly below so the difference
     # between containers is visible in the log rather than surprising.
+    # The file to embed INTO. In an ordinary run that is the media this run
+    # produced. In a refresh it is the media the folder already held, which
+    # is the entire reason a refresh beats deleting the folder and
+    # downloading the video again: `ytdl --mode comments-only` on its own
+    # cannot do this, because it has no media file to embed into and would
+    # leave the .mkv carrying the old, comment-poor info.json while
+    # Video metadata/ held the new one -- two answers to the same question
+    # inside one folder.
+    $embedTarget = if ($Refresh) { $refreshMediaPath } else { $mediaFilePath }
+    # Whether the media file on disk was actually rewritten by the block
+    # below. Only consulted on a refresh, where it decides whether the
+    # Final Video repository's copy has gone stale -- see the sync further
+    # down. In an ordinary run the copy is made from the freshly downloaded
+    # file regardless, so the flag has nothing to decide.
+    $reembedded = $false
+
     try {
-        if ($mediaFilePath -and $mediaFilePath -match '\.mkv$' -and $infoJsonFile) {
+        if ($embedTarget -and $embedTarget -match '\.mkv$' -and $infoJsonFile) {
             # Count existing attachment-type streams so the mimetype tag
             # below targets ONLY the new one we're adding. Without an
             # explicit index, ffmpeg's "s:t" specifier matches every
             # attachment stream, which would mislabel the already-embedded
             # thumbnail as application/json too.
             $existingAttachCount = 0
-            $probeOutput = & ffprobe -v error -select_streams t -show_entries stream=index -of csv=p=0 $mediaFilePath 2>&1
+            $probeOutput = & ffprobe -v error -select_streams t -show_entries stream=index -of csv=p=0 $embedTarget 2>&1
             if ($LASTEXITCODE -eq 0) {
                 $existingAttachCount = @($probeOutput | Where-Object { $_ -match '^\d+$' }).Count
             } else {
@@ -843,23 +931,32 @@ try {
             # fast, but on a very large file or a slow disk there's no
             # reason to let output sit buffered instead of showing up as
             # it happens.
-            $ffmpegOutput = & ffmpeg -y -i $mediaFilePath -attach $infoJsonFile.FullName -metadata:s:t:$existingAttachCount "mimetype=application/json" -map 0 -c copy $remuxTemp 2>&1 | ForEach-Object {
+            $ffmpegOutput = & ffmpeg -y -i $embedTarget -attach $infoJsonFile.FullName -metadata:s:t:$existingAttachCount "mimetype=application/json" -map 0 -c copy $remuxTemp 2>&1 | ForEach-Object {
                 Log "  [ffmpeg-reembed] $_"
                 $_
             }
 
             if ((Test-Path $remuxTemp) -and (Get-Item $remuxTemp).Length -gt 0) {
-                Remove-Item -Path $mediaFilePath -Force
-                Move-Item -Path $remuxTemp -Destination $mediaFilePath -Force
-                Log "Re-embedded comment-complete info.json into $mediaFilePath."
+                Remove-Item -Path $embedTarget -Force
+                Move-Item -Path $remuxTemp -Destination $embedTarget -Force
+                $reembedded = $true
+                Log "Re-embedded comment-complete info.json into $embedTarget."
             } else {
                 Log "WARNING: Re-embed produced no output file -- original left untouched. Comments are still in the sidecar info.json, just not embedded in the .mkv."
                 Remove-Item -Path $remuxTemp -Force -ErrorAction SilentlyContinue
             }
-        } elseif (-not $mediaFilePath) {
-            Log "Skipped info.json re-embed: --mode $Mode downloaded no media file to embed into. The comment-complete info.json is in Video metadata/ as usual."
-        } elseif ($mediaFilePath -notmatch '\.mkv$') {
-            Log "Skipped info.json re-embed: only Matroska carries file attachments, and this run produced $(Split-Path $mediaFilePath -Leaf). The comment-complete info.json is in Video metadata/ as usual."
+        } elseif (-not $embedTarget) {
+            # Three different reasons, said differently, because they are
+            # three different situations and the log is where someone
+            # works out which one they are in.
+            if ($Refresh) {
+                Log "Skipped info.json re-embed: --refresh found no existing media file in this folder to embed into. The comment-complete info.json is in Video metadata/ as usual."
+            } else {
+                Log "Skipped info.json re-embed: --mode $Mode downloaded no media file to embed into. The comment-complete info.json is in Video metadata/ as usual."
+            }
+        } elseif ($embedTarget -notmatch '\.mkv$') {
+            $whence = if ($Refresh) { "this folder holds" } else { "this run produced" }
+            Log "Skipped info.json re-embed: only Matroska carries file attachments, and $whence $(Split-Path $embedTarget -Leaf). The comment-complete info.json is in Video metadata/ as usual."
         }
     } catch {
         Log "WARNING: Re-embed of info.json failed: $($_.Exception.Message). Original file left untouched; comments are still in the sidecar info.json."
@@ -964,6 +1061,57 @@ try {
         $mediaFilePath.Substring($videoDir.Length + 1).Replace([System.IO.Path]::DirectorySeparatorChar, '/')
     } else { $null }
 
+    # --- The two fields a refresh must NOT rewrite ---
+    # download_mode and media_file describe how this FOLDER came to be, not
+    # what the most recent pass did to it. A refresh is by definition a
+    # second pass over a folder that already exists, so it inherits both
+    # and records itself separately.
+    #
+    # The order of the checks matters. $priorManifest is $null when the
+    # folder had no readable manifest, and in that case the values computed
+    # above are used unchanged -- writing a $Mode manifest is a poorer
+    # answer than preserving a real one, but it is a far better answer than
+    # writing nothing, and the read failure was already logged.
+    #
+    # PSObject.Properties rather than a null test on the value itself:
+    # media_file is legitimately $null in a no-media folder, and "the field
+    # was absent" and "the field said null" have to be told apart or a
+    # refresh of a comments-only folder would fall through to $mediaFileRel
+    # and claim a media file that is not there.
+    $downloadModeOut = $Mode
+    $mediaFileOut    = $mediaFileRel
+    $refreshHistory  = $null
+    if ($Refresh -and $priorManifest) {
+        if ($priorManifest.PSObject.Properties.Name -contains 'download_mode' -and $priorManifest.download_mode) {
+            $downloadModeOut = $priorManifest.download_mode
+        }
+        if ($priorManifest.PSObject.Properties.Name -contains 'media_file') {
+            $mediaFileOut = $priorManifest.media_file
+        }
+    }
+    if ($Refresh) {
+        # Appended, never replaced: a folder can be refreshed for comments
+        # in March and for subtitles in July, and both are part of what it
+        # is. An array of small records rather than a single last_refresh
+        # field for exactly that reason.
+        $refreshHistory = @()
+        if ($priorManifest -and $priorManifest.PSObject.Properties.Name -contains 'refresh_history' -and $priorManifest.refresh_history) {
+            $refreshHistory = @($priorManifest.refresh_history)
+        }
+        $refreshHistory += [ordered]@{
+            time           = (Get-Date).ToString("o")
+            mode           = $Mode
+            yt_dlp_version = $ytDlpVersion
+            embedded       = [bool]$embedTarget
+        }
+    } elseif ($priorManifest -and $priorManifest.PSObject.Properties.Name -contains 'refresh_history') {
+        # Unreachable today ($priorManifest is only read under -Refresh),
+        # and written anyway: if a later change starts reading the prior
+        # manifest in ordinary runs too, a full re-download of a folder
+        # that had been refreshed should not silently drop its history.
+        $refreshHistory = @($priorManifest.refresh_history)
+    }
+
     # --- manifest.json (#8) ---
     $manifest = [ordered]@{
         # First field on purpose: a consumer that cannot understand this
@@ -980,8 +1128,23 @@ try {
         # is a VALID state under layout 2, not a corrupt folder);
         # run_settings carries the per-run overrides that config_file_version
         # can no longer imply on its own.
-        download_mode           = $Mode
-        media_file              = $mediaFileRel
+        download_mode           = $downloadModeOut
+        media_file              = $mediaFileOut
+        # New alongside --refresh, and deliberately NOT an archive layout
+        # bump. docs/archive-layout.md's rule is that adding a field a
+        # reader may ignore is additive: a layout-2 consumer that has never
+        # heard of refresh_history reads this folder exactly as correctly
+        # as it did before, because the two fields it does read --
+        # download_mode and media_file -- now say what they always said.
+        # Bumping to 3 would make every existing reader flag every
+        # refreshed video as "written with a newer archive layout", which
+        # is a loud warning about nothing.
+        #
+        # $null rather than an empty array for a folder that has never been
+        # refreshed: absent and "refreshed zero times" are the same fact,
+        # and a null costs a reader one existence check instead of a length
+        # check on something it has to allocate first.
+        refresh_history         = $refreshHistory
         run_settings            = $runSettings
         video_id                = $videoId
         title                   = $title
@@ -1156,7 +1319,21 @@ try {
             # this folder" is the entire contract of this tree, and a
             # zero-byte entry would break it more thoroughly than a missing
             # one.
-            if ($mediaFilePath -and (Test-Path $mediaFilePath)) {
+            # A refresh normally has nothing to copy here -- it downloaded
+            # no media, and the copy already in this tree is still the same
+            # bytes as the one in Complete Archive. The exception is a
+            # refresh that RE-EMBEDDED: that rewrites the archived .mkv, so
+            # the copy here is now a file whose attachments disagree with
+            # the archive's. Leaving it would make the refresh's whole
+            # point -- that the media carries the comment-complete
+            # info.json -- true in one tree and false in the other, with
+            # nothing on disk saying which is which.
+            $finalVideoSource = if ($Refresh) {
+                if ($reembedded) { $embedTarget } else { $null }
+            } else {
+                $mediaFilePath
+            }
+            if ($finalVideoSource -and (Test-Path $finalVideoSource)) {
                 # Full descriptive filename, built from the already-sanitized
                 # folder name rather than reconstructed from raw (unsanitized)
                 # info.json fields -- the folder name has already been through
@@ -1165,8 +1342,13 @@ try {
                 # The extension comes off the actual media file, so a
                 # --container mp4 run or an audio-only .opus lands here with
                 # the right one rather than an assumed .mkv.
-                $finalVideoFileName = (Split-Path $videoDir -Leaf) + [System.IO.Path]::GetExtension($mediaFilePath)
-                Copy-Item -Path $mediaFilePath -Destination (Join-Path $finalVideoChannelDir $finalVideoFileName) -Force
+                $finalVideoFileName = (Split-Path $videoDir -Leaf) + [System.IO.Path]::GetExtension($finalVideoSource)
+                Copy-Item -Path $finalVideoSource -Destination (Join-Path $finalVideoChannelDir $finalVideoFileName) -Force
+                if ($Refresh) {
+                    Log "Final Video repository: re-synced $finalVideoFileName, because the refresh re-embedded a new info.json into the archived media."
+                }
+            } elseif ($Refresh) {
+                Log "Final Video repository: nothing to re-sync -- this refresh did not rewrite the media file. Channel manifest and Channel Info still refreshed."
             } else {
                 Log "Final Video repository: no media file to sync for --mode $Mode; channel manifest and Channel Info still refreshed."
             }

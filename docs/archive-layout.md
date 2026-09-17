@@ -96,12 +96,46 @@ Guaranteed present, with at least these fields:
 | `config_file_version` | `CONFIG_VERSION` from `yt-dlp.conf` — the static baseline only |
 | `download_mode` | *(2)* which `--mode` wrote this folder |
 | `media_file` | *(2)* the media file's folder-relative path, or `null` |
+| `refresh_history` | *(2, optional)* passes that re-fetched a component into this folder, or `null`; see below |
 | `run_settings` | *(2)* the per-run overrides; see below |
 | `video_id`, `title`, `uploader`, `upload_date` | identity |
 | `original_url`, `channel_url` | provenance |
 | `codecs`, `subtitle_languages` | what was captured |
 | `every_filename`, `file_hashes` | inventory, paths `/`-separated |
 | `comment_audit` | completeness of the comments pass |
+
+#### `refresh_history`, and what a refresh does *not* change
+
+`ytdl --refresh --mode comments-only|subs-only|metadata-only` re-fetches one
+component into a video folder that already exists. That is a second pass over
+a folder, not a second folder, and the manifest has to say so without lying
+about the first pass.
+
+So a refresh **preserves** `download_mode` and `media_file` exactly as the
+original run wrote them, and appends one record here instead:
+
+| Key | Meaning |
+|---|---|
+| `time` | ISO 8601, when the refresh's post-processing finished |
+| `mode` | the no-media `--mode` that ran |
+| `yt_dlp_version` | the version that fetched it |
+| `embedded` | whether the comment-complete `info.json` was re-embedded into the media |
+
+The field is **absent or `null`** on every folder that has never been
+refreshed, which is nearly all of them.
+
+**This is not a layout bump, and a reader that ignores the field is still
+correct.** The two fields a consumer actually reads — `download_mode` and
+`media_file` — say after a refresh exactly what they said before it, which is
+the whole point of preserving them. A reader that *does* want the difference
+gets it for free: a full video with a `refresh_history` entry is one whose
+comments are newer than its media.
+
+What a refresh *does* rewrite is everything that is newly true about the
+folder: `comment_audit`, `subtitle_languages`, `every_filename`, `file_hashes`
+and `archive_creation_time`. Re-verify `checksums.sha256` after a refresh
+rather than assuming a cached result still holds — the sidecars changed, and
+if `embedded` is `true` the media file changed too.
 
 #### `run_settings`, and why `config_file_version` is no longer enough
 
@@ -157,6 +191,13 @@ These are not edge cases; they occur in normal operation:
 - **`checksums.sha256` excludes `Logs/video_postprocessing.log`**, which is
   still being appended to when the hashes are computed. A consumer verifying
   the manifest must not treat its absence as a failure.
+- **A folder whose contents changed without its `download_mode` changing.**
+  A refresh rewrites the sidecars, the hashes and `archive_creation_time` of
+  a folder that already existed, and may rewrite the media file itself (the
+  info.json re-embed). A consumer caching anything per video — an index
+  entry, a parsed comment tree, a verification result — must key that cache
+  on something that moves, such as `archive_creation_time` or the manifest's
+  own mtime, not on the folder existing.
 
 ## What bumping means
 

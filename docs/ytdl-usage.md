@@ -380,6 +380,56 @@ Leaving it alone is what the rest of this pipeline optimises for.
 file is what triggers post-processing when there is no media file to trigger
 it. The run says so rather than silently producing nothing.
 
+## Filling in a video you already have
+
+### `--refresh`
+
+Valid **only** with `--mode metadata-only`, `--mode comments-only` or
+`--mode subs-only`. It says: this video is already in the archive; fetch the
+named component again and merge it into the folder that is already there.
+
+```bash
+# The comments pass failed, or it ran months ago and the thread has moved on
+ytdl "https://youtu.be/VIDEOID" --mode comments-only --refresh
+
+# Captions were published after you archived the video
+ytdl "https://youtu.be/VIDEOID" --mode subs-only --refresh
+```
+
+Without the flag those three modes cannot touch an archived video **at all**,
+and the failure is invisible. `--download-archive` is on for every run, so
+yt-dlp skips any id already in `archive.txt` — which is every video you would
+want to re-fetch anything for. On top of that, `config/yt-dlp.conf` carries
+`--no-overwrites`, so even reaching the video would leave the existing
+`info.json` in place, which means yt-dlp never *moves* it, which means the
+`--exec after_move` hook never fires and `postprocess.ps1` never runs. The
+session ends clean, exit code 0, with nothing changed.
+
+`--refresh` fixes both halves and adds a third thing you cannot get any other
+way:
+
+- **It runs without `--download-archive`.** Nothing is skipped, and — equally
+  important — nothing is re-recorded. The ids in `archive.txt` are already
+  there and are left byte-for-byte alone.
+- **It runs with `--force-overwrites`.** Safe here precisely because a
+  refresh is always a no-media mode: the only files yt-dlp can write are the
+  ones you asked it to replace. The media file is not among them.
+- **It re-embeds the comment-complete `info.json` into the media file.** A
+  plain `--mode comments-only` run cannot do this — it has no media file to
+  embed into — so it would leave your `.mkv` carrying the old, comment-poor
+  copy while `Video metadata/` held the new one. This is the reason a refresh
+  is worth more than deleting the folder and downloading the video again.
+
+The manifest is **merged**, not rewritten. `download_mode` and `media_file`
+keep whatever the original run wrote, so a full video refreshed for comments
+stays a full video; what this pass did is recorded in a new `refresh_history`
+array instead. See `docs/archive-layout.md`.
+
+Refused with `--sync`, which stops at the first already-archived video and
+would therefore stop at every video `--refresh` exists to reach. Refused with
+`--probe`, which downloads nothing. Refused with a media `--mode`: to replace
+a video, remove its folder and its `archive.txt` line and download it again.
+
 ### `--ytdlp-arg ARG`
 
 Passes an argument straight to yt-dlp, after the config file so it wins.
@@ -473,6 +523,11 @@ something other than what was asked:
 --no-audio --mode audio-only              the alias contradicts the mode
 --mode comments-only --no-comments        would fetch nothing
 --mode comments-only --quality 1080       the mode downloads no media
+--refresh                                 without a no-media --mode
+--refresh --mode full                     a refresh merges, it can't replace
+--refresh --sync                          --sync stops at exactly the videos
+                                          --refresh is for
+--refresh --probe                         a probe downloads nothing
 ```
 
 ## Combining flags

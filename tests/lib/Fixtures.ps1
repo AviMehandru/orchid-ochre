@@ -786,6 +786,7 @@ function Invoke-Postprocess {
         # only actually true if the tests keep running it that way.
         [string]$Mode,
         [switch]$NoComments,
+        [switch]$Refresh,
         [hashtable]$RunSettings
     )
     $script = Join-Path $TestRoot.InstallRoot 'scripts/postprocess.ps1'
@@ -795,6 +796,7 @@ function Invoke-Postprocess {
         $extra = @()
         if ($PSBoundParameters.ContainsKey('Mode')) { $extra += @('-Mode', $Mode) }
         if ($NoComments) { $extra += '-NoComments' }
+        if ($Refresh) { $extra += '-Refresh' }
         if ($RunSettings) {
             $extra += @('-RunSettingsB64', [System.Convert]::ToBase64String(
                 [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -Depth 6 -InputObject $RunSettings))))

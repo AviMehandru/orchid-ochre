@@ -620,6 +620,126 @@ throws "Could not find item" on a path Test-Path just confirmed exists.
         } finally { Remove-TestRoot $r }
     }
 
+    It 'preserves download_mode and media_file when refreshing an archived video' {
+        # THE reason --refresh needed a pipeline change rather than a button
+        # in the apps. Without -Refresh, a comments-only pass over a folder
+        # that already holds a full video writes download_mode
+        # "comments-only" and media_file $null -- and every reader of this
+        # archive believes it, because docs/archive-layout.md tells them to
+        # prefer the manifest over globbing. The video is still on disk; the
+        # manifest has simply started lying about it.
+        $r = New-PostprocessRoot -Label 'pp-refresh-merge' -VideoArgs @{ SeedChannelInfoThrottle = $true }
+        try {
+            $null = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.MkvPath -Mode 'full'
+            $first = Get-Content (Join-Path $r.Video.MetaDir 'manifest.json') -Raw | ConvertFrom-Json
+            Assert-Equal 'full' $first.download_mode 'precondition: the folder starts as a full download'
+            Assert-True ($null -eq $first.refresh_history) `
+                'a folder that has never been refreshed must not carry a history'
+
+            # The refresh: triggered by the info.json, exactly as
+            # run_ytdlp.ps1's --skip-download run would trigger it.
+            $result = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.InfoPath `
+                -Mode 'comments-only' -Refresh
+            Assert-Match 'this folder already holds' $result.Output
+
+            $after = Get-Content (Join-Path $r.Video.MetaDir 'manifest.json') -Raw | ConvertFrom-Json
+            Assert-Equal 'full' $after.download_mode `
+                'a refresh is a second pass over a folder, not the thing that created it'
+            Assert-Equal 'Final files/Final Video.mkv' $after.media_file `
+                'the media file is still on disk, so the manifest must still name it'
+
+            $history = @($after.refresh_history)
+            Assert-Equal 1 $history.Count 'the refresh must be recorded somewhere'
+            Assert-Equal 'comments-only' $history[0].mode
+            Assert-True ([bool]$history[0].time) 'each refresh record carries when it happened'
+
+            # Not a layout bump: the two fields a consumer actually reads
+            # say after the refresh exactly what they said before it, which
+            # is the whole point of preserving them.
+            Assert-Equal $first.archive_layout_version $after.archive_layout_version `
+                'preserving the fields is what makes this additive rather than a bump'
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'appends to refresh_history rather than replacing it' {
+        # A folder can legitimately be refreshed for comments in March and
+        # for subtitles in July, and both are part of what it is. An array
+        # of records rather than a single last_refresh field exists for
+        # exactly that, and a merge that overwrote would be invisible --
+        # the manifest would still look correct, just shorter.
+        $r = New-PostprocessRoot -Label 'pp-refresh-append' -VideoArgs @{ SeedChannelInfoThrottle = $true }
+        try {
+            $null = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.MkvPath -Mode 'full'
+            $null = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.InfoPath -Mode 'comments-only' -Refresh
+            $null = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.InfoPath -Mode 'subs-only' -Refresh
+
+            $manifest = Get-Content (Join-Path $r.Video.MetaDir 'manifest.json') -Raw | ConvertFrom-Json
+            $history = @($manifest.refresh_history)
+            Assert-Equal 2 $history.Count 'the second refresh must not discard the first'
+            Assert-Equal 'comments-only' $history[0].mode 'oldest first'
+            Assert-Equal 'subs-only'     $history[1].mode
+            Assert-Equal 'full' $manifest.download_mode `
+                'no number of refreshes changes what originally wrote the folder'
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'falls back to writing a plain manifest when a refresh finds none to merge' {
+        # A real state, not a bug: a folder written before layout 2, or one
+        # whose manifest was lost, can still be refreshed. Writing a $Mode
+        # manifest is a poorer answer than preserving a real one and a far
+        # better answer than writing nothing -- but it must SAY so, because
+        # this is the one path where a refresh does relabel a folder.
+        $r = New-PostprocessRoot -Label 'pp-refresh-nomanifest' -VideoArgs @{
+            OmitVideoFile = $true; SeedChannelInfoThrottle = $true }
+        try {
+            $result = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.InfoPath `
+                -Mode 'comments-only' -Refresh
+            Assert-Match 'found no existing manifest\.json' $result.Output `
+                'silently relabelling the folder would be the wrong kind of quiet'
+
+            $manifest = Get-Content (Join-Path $r.Video.MetaDir 'manifest.json') -Raw | ConvertFrom-Json
+            Assert-Equal 'comments-only' $manifest.download_mode
+            Assert-Equal 1 @($manifest.refresh_history).Count `
+                'the pass still happened and still belongs in the history'
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 're-embeds the new info.json into the media a refresh did not download' {
+        # The part that makes --refresh worth more than deleting the folder
+        # and downloading the video again. A plain --mode comments-only run
+        # has no media file to embed into, so it leaves the .mkv carrying
+        # the old, comment-poor info.json while Video metadata/ holds the
+        # new one -- two answers to the same question inside one folder.
+        if (-not (Test-HasCommand 'ffmpeg') -or -not (Test-HasCommand 'ffprobe')) {
+            Skip-Test 'ffmpeg/ffprobe are not on PATH.'
+        }
+        $r = New-PostprocessRoot -Label 'pp-refresh-reembed' -VideoArgs @{ SeedChannelInfoThrottle = $true }
+        try {
+            if (-not $r.Video.HasRealMkv) { Skip-Test 'Could not build a real .mkv fixture with ffmpeg.' }
+            $null = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.MkvPath -Mode 'full'
+            $before = (Get-Item -LiteralPath $r.Video.MkvPath).Length
+
+            $result = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.InfoPath `
+                -Mode 'comments-only' -Refresh
+            Assert-Match 'Re-embedded comment-complete info\.json' $result.Output
+            Assert-PathExists $r.Video.MkvPath 'the video must survive a refresh that rewrites it'
+            Assert-True ((Get-Item -LiteralPath $r.Video.MkvPath).Length -ge $before) `
+                'the refresh re-attaches the info.json rather than dropping attachments'
+
+            $manifest = Get-Content (Join-Path $r.Video.MetaDir 'manifest.json') -Raw | ConvertFrom-Json
+            Assert-True ([bool]@($manifest.refresh_history)[0].embedded) `
+                'the history records whether the media was actually rewritten'
+
+            # And because the media was rewritten, the Final Video copy of
+            # it is now stale -- two files that are supposed to be the same
+            # bytes and no longer are, with nothing on disk saying which is
+            # which.
+            Assert-Match 'Final Video repository: re-synced' $result.Output
+            $temps = @(Get-ChildItem -LiteralPath $r.Video.FinalFiles -Filter '_remux_temp_*' -ErrorAction SilentlyContinue)
+            Assert-Equal 0 $temps.Count 'the remux temp file must be swapped in or removed, never left behind'
+        } finally { Remove-TestRoot $r }
+    }
+
     It 'keeps a media-less run out of the Final Video repository' {
         # "Point a media player at this folder" is the entire contract of
         # that tree, and a zero-byte or placeholder entry would break it

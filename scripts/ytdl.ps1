@@ -109,6 +109,46 @@
       --no-audio        Alias for --mode video-only.
       --no-video        Alias for --mode audio-only.
 
+    Filling in a video that is ALREADY archived:
+
+      --refresh         Only with --mode metadata-only, comments-only or
+                        subs-only. Says: this video is already in the
+                        archive; fetch the named component AGAIN and merge
+                        it into the folder that is already there.
+
+                        Without this flag those three modes cannot touch an
+                        archived video at all, and the reason is not
+                        obvious. --download-archive is on by default, so
+                        yt-dlp skips any id already in archive.txt -- which
+                        is every video you would want to re-fetch comments
+                        for. --refresh runs that one session WITHOUT
+                        --download-archive, so nothing is skipped and,
+                        equally important, nothing is re-recorded: the ids
+                        in archive.txt are already there and stay exactly
+                        as they were.
+
+                        The second half is in postprocess.ps1. A no-media
+                        mode ordinarily writes download_mode with its own
+                        mode and media_file = null, which is correct for a
+                        folder that mode CREATED and a lie about a folder
+                        that already holds a video. Under --refresh the
+                        previous manifest's download_mode and media_file
+                        are carried over verbatim and the refresh is
+                        recorded in a new refresh_history array instead --
+                        so a full video refreshed for comments stays a full
+                        video that has been refreshed, which is what it is.
+
+                        Because the media file survives, the comment-
+                        complete info.json is re-embedded into it, which a
+                        plain --mode comments-only run cannot do (it has no
+                        media to embed into). That is the part that makes
+                        this worth more than deleting the folder and
+                        downloading the video again.
+
+                        Refused with --sync, which stops at the first
+                        already-archived video and would therefore stop at
+                        every video --refresh exists to reach.
+
     Asking instead of downloading:
 
       --probe           Do not download anything. Print ONE JSON document
@@ -224,6 +264,7 @@ Usage: ytdl <youtube-url> [download-root-path] [options]
              [--audio-codec any|opus|aac|mp3|flac] [--container mkv|mp4|webm]
   Skips:     [--no-comments] [--no-subs] [--no-thumbnail] [--no-metadata]
              [--no-audio] [--no-video]
+  Re-fetch:  [--refresh]         (with --mode metadata-only|comments-only|subs-only)
   Escape:    [--ytdlp-arg ARG]   (repeatable)
   Ask only:  [--probe]           (prints JSON, downloads nothing)
 "@
@@ -243,7 +284,7 @@ if ($argList.Count -eq 0 -or [string]::IsNullOrWhiteSpace($argList[0])) {
 $knownOptions = @("--sync", "--items", "--after", "--lazy", "--workers", "--path", "--no-pot", "--skip-pot-update", "--pot-port",
                   "--mode", "--quality", "--codec", "--audio-codec", "--container",
                   "--no-comments", "--no-subs", "--no-thumbnail", "--no-metadata", "--no-audio", "--no-video",
-                  "--ytdlp-arg", "--probe")
+                  "--refresh", "--ytdlp-arg", "--probe")
 
 # The accepted values for the four enumerated content options. Validated
 # HERE, at the point the user typed them, rather than left to
@@ -360,6 +401,7 @@ $noMetadata      = $false
 # to be typed last.
 $noAudio         = $false
 $noVideo         = $false
+$refresh         = $false
 $ytdlpArgs       = @()
 $probe           = $false
 
@@ -496,6 +538,9 @@ while ($i -lt $rest.Count) {
         "--no-audio"     { $noAudio     = $true; $i++ }
         "--no-video"     { $noVideo     = $true; $i++ }
 
+        # --- Re-fetch into an existing folder ---
+        "--refresh"      { $refresh     = $true; $i++ }
+
         # --- Passthrough ---
         # Accumulated in order and handed to run_ytdlp.ps1 as a single
         # array parameter. NOT validated for meaning here: the whole point
@@ -576,6 +621,34 @@ if ($mode -eq "subs-only" -and $noSubs) {
     exit 1
 }
 
+# --- --refresh's own contract ---
+# Checked here, after alias resolution, so the message names the mode the
+# user ends up with rather than the one they typed. The two refusals are
+# different in kind and worth separating:
+#
+# The mode check is about what --refresh MEANS. Merging a component into a
+# folder that already exists only makes sense for the three modes that
+# download no media; "--refresh --mode full" would be asking to re-download
+# the video, which is what deleting the folder and running it again does,
+# and pretending otherwise would leave someone with a half-replaced folder.
+#
+# The --sync check is about the two flags cancelling each other out.
+# --sync is --break-on-existing: stop at the first video already in
+# archive.txt. Every video --refresh can be pointed at is in archive.txt by
+# definition, so the pair reliably produces a session that stops before
+# doing anything, with a log that reads like a successful no-op.
+if ($refresh) {
+    if ($noMediaModes -notcontains $mode) {
+        $what = if ($mode) { "--mode $mode" } else { "no --mode" }
+        Write-Usage "Error: --refresh needs one of --mode $($noMediaModes -join ', ') -- it merges a re-fetched component into a folder that already exists, and $what would download media into it instead. To replace a video, remove its folder and its archive.txt line and download it again."
+        exit 1
+    }
+    if ($breakOnExisting) {
+        Write-Usage "Error: --refresh and --sync contradict each other. --sync stops at the first video already in archive.txt, and every video --refresh can reach is already in archive.txt."
+        exit 1
+    }
+}
+
 # --audio-codec only reaches yt-dlp in audio-only mode (it drives the
 # audio-extraction postprocessor, which only runs there). Warned about
 # rather than rejected: it is a no-op, not a wrong result.
@@ -620,6 +693,11 @@ if ($probe) {
     if ($noSubs)          { $downloadOnlyOpts += "--no-subs" }
     if ($noThumbnail)     { $downloadOnlyOpts += "--no-thumbnail" }
     if ($noMetadata)      { $downloadOnlyOpts += "--no-metadata" }
+    # Listed here even though the --mode check above has already refused
+    # every --refresh command line that could also carry --probe: the
+    # refusal list is the contract, and an option missing from it is the
+    # kind of gap that survives a later change to the checks above.
+    if ($refresh)         { $downloadOnlyOpts += "--refresh" }
     if ($downloadOnlyOpts.Count -gt 0) {
         Write-Usage "Error: --probe downloads nothing, so $($downloadOnlyOpts -join ', ') cannot apply. Probe the URL first, then run it with the options you want."
         exit 1
@@ -665,6 +743,7 @@ if ($noComments)     { $pwshArgs += "-NoComments" }
 if ($noSubs)         { $pwshArgs += "-NoSubs" }
 if ($noThumbnail)    { $pwshArgs += "-NoThumbnail" }
 if ($noMetadata)     { $pwshArgs += "-NoMetadata" }
+if ($refresh)        { $pwshArgs += "-Refresh" }
 
 # --- Passing an ARRAY across `pwsh -File`, which cannot be done directly ---
 # This is the same boundary problem setup-common.ps1 documents for

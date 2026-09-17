@@ -52,6 +52,7 @@ param(
     [Parameter(Mandatory = $false)][switch]$NoSubs,
     [Parameter(Mandatory = $false)][switch]$NoThumbnail,
     [Parameter(Mandatory = $false)][switch]$NoMetadata,
+    [Parameter(Mandatory = $false)][switch]$Refresh,
     [Parameter(Mandatory = $false)][string]$YtdlpArgsB64 = ""
 )
 # The passthrough array is decoded here rather than captured raw, so the
@@ -83,6 +84,7 @@ if ($YtdlpArgsB64) {
     NoSubs          = [bool]$NoSubs
     NoThumbnail     = [bool]$NoThumbnail
     NoMetadata      = [bool]$NoMetadata
+    Refresh         = [bool]$Refresh
     Passthrough     = $decodedPassthrough
 } | ConvertTo-Json | Set-Content -LiteralPath $env:YTDL_TEST_CAPTURE
 '@
@@ -401,6 +403,51 @@ if ($YtdlpArgsB64) {
         $nothing = Invoke-Launcher -Arguments @($url, '--mode', 'comments-only', '--no-comments')
         Assert-Equal 1 $nothing.ExitCode
         Assert-Match 'would fetch nothing at all' $nothing.Output
+    }
+
+    It 'passes --refresh through alongside a no-media mode' {
+        foreach ($mode in @('metadata-only', 'comments-only', 'subs-only')) {
+            $r = Invoke-Launcher -Arguments @($url, '--mode', $mode, '--refresh')
+            Assert-Equal 0 $r.ExitCode "--refresh must be accepted with --mode $mode"
+            Assert-True $r.Params.Refresh "--refresh must reach run_ytdlp.ps1 for --mode $mode"
+            Assert-Equal $mode $r.Params.Mode
+        }
+    }
+
+    It 'leaves Refresh unset when --refresh was not given' {
+        # The half of a new switch that is easy to get wrong and impossible
+        # to notice: a flag that is always emitted looks identical in every
+        # test that passes it.
+        $r = Invoke-Launcher -Arguments @($url, '--mode', 'comments-only')
+        Assert-Equal 0 $r.ExitCode
+        Assert-False $r.Params.Refresh 'a run without --refresh must not become a refresh'
+    }
+
+    It 'refuses --refresh where it would mean something other than a merge' {
+        # Three different wrong meanings, all of which would otherwise run:
+        #
+        #   no --mode / a media mode -- asks to re-download the video into a
+        #     folder that already holds one, which is a half-replaced folder,
+        #     not a refresh.
+        #   --sync -- is --break-on-existing, and every video --refresh can
+        #     reach is already in archive.txt, so the pair reliably produces a
+        #     session that stops before doing anything and logs a clean no-op.
+        #   --probe -- downloads nothing at all, so there is nothing to merge.
+        $bare = Invoke-Launcher -Arguments @($url, '--refresh')
+        Assert-Equal 1 $bare.ExitCode
+        Assert-Match '--refresh needs one of --mode' $bare.Output
+        Assert-True ($null -eq $bare.Params) 'run_ytdlp.ps1 must not be started at all'
+
+        $full = Invoke-Launcher -Arguments @($url, '--mode', 'full', '--refresh')
+        Assert-Equal 1 $full.ExitCode
+        Assert-Match '--refresh needs one of --mode' $full.Output
+
+        $sync = Invoke-Launcher -Arguments @($url, '--mode', 'comments-only', '--refresh', '--sync')
+        Assert-Equal 1 $sync.ExitCode
+        Assert-Match 'contradict each other' $sync.Output
+
+        $probe = Invoke-Launcher -Arguments @($url, '--mode', 'subs-only', '--refresh', '--probe')
+        Assert-Equal 1 $probe.ExitCode
     }
 
     It 'rejects a media option against a mode that downloads no media' {

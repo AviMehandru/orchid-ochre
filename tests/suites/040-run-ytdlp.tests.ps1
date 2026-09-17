@@ -420,6 +420,87 @@ the throttle silently never engages on Linux or macOS.
         } finally { Remove-TestRoot $r }
     }
 
+    It 'drops --download-archive entirely for a refresh, and only for a refresh' {
+        # The first half of what --refresh had to change in the pipeline.
+        # --download-archive makes yt-dlp skip any id already in
+        # archive.txt, which is every id a refresh can be pointed at -- so
+        # without this the command runs, exits 0, and does nothing.
+        #
+        # Omitting the flag rather than pointing it at a scratch copy (the
+        # degraded path's answer) is the deliberate part: a refresh
+        # downloads no media, so it has no new archive line it could
+        # legitimately write, and archive.txt is left untouched.
+        $r = New-OrchestratorRoot -Label 'content-refresh-archive' -Behavior $downloadBehavior
+        try {
+            $null = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-Mode', 'comments-only', '-Refresh')
+            $call = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                      Where-Object { $_.args -contains '--config-location' })[-1]
+            Assert-False ($call.args -contains '--download-archive') `
+                'a refresh that passes --download-archive is skipped by yt-dlp and does nothing'
+
+            # And the other direction, because a flag that is always absent
+            # looks identical to one that is correctly absent.
+            $r2 = New-OrchestratorRoot -Label 'content-refresh-archive-neg' -Behavior $downloadBehavior
+            try {
+                $null = Invoke-RunYtdlp -TestRoot $r2 -Url 'https://youtu.be/testVideo01' `
+                    -ExtraArgs @('-Mode', 'comments-only')
+                $plain = @(Get-StubCalls -TestRoot $r2 -Name 'yt-dlp' |
+                           Where-Object { $_.args -contains '--config-location' })[-1]
+                Assert-True ($plain.args -contains '--download-archive') `
+                    'an ordinary run must still record and consult archive.txt'
+            } finally { Remove-TestRoot $r2 }
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'forces overwrites for a refresh, because the conf says not to' {
+        # The second half, and the subtler one. config/yt-dlp.conf carries
+        # --no-overwrites, which is right for a download and silently fatal
+        # for a refresh: the existing info.json is left alone, so yt-dlp
+        # never MOVES it, so --exec after_move never fires, so
+        # postprocess.ps1 never runs. Clean log, exit 0, nothing changed.
+        #
+        # Safe here only because a refresh is always a no-media mode --
+        # --skip-download means the only files yt-dlp can write are the
+        # ones the refresh was asked to replace.
+        $r = New-OrchestratorRoot -Label 'content-refresh-overwrite' -Behavior $downloadBehavior
+        try {
+            $null = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-Mode', 'subs-only', '-Refresh')
+            $call = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                      Where-Object { $_.args -contains '--config-location' })[-1]
+            Assert-True ($call.args -contains '--force-overwrites') `
+                'without this the refresh leaves the sidecars alone and the hook never fires'
+            Assert-True ($call.args -contains '--skip-download') `
+                'a refresh is always a no-media mode -- that is what makes --force-overwrites safe'
+
+            $confIdx  = [array]::IndexOf($call.args, '--config-location')
+            $forceIdx = [array]::IndexOf($call.args, '--force-overwrites')
+            Assert-True ($forceIdx -gt $confIdx) `
+                'emitted before the conf it would lose to --no-overwrites, which is the whole failure'
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'refuses -Refresh in the combinations ytdl.ps1 would have caught' {
+        # run_ytdlp.ps1 is documented as directly invocable (CLAUDE.md's
+        # manual repair path calls it that way), so it cannot rely on the
+        # launcher having checked. A -Refresh that silently did nothing in
+        # full mode is precisely the quiet wrong result this pipeline
+        # refuses on principle.
+        $r = New-OrchestratorRoot -Label 'content-refresh-refuse' -Behavior $downloadBehavior
+        try {
+            $full = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-Mode', 'full', '-Refresh')
+            Assert-Equal 2 $full.ExitCode
+            Assert-Match '-Refresh requires -Mode' $full.Output
+
+            $sync = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-Mode', 'comments-only', '-Refresh', '-BreakOnExisting')
+            Assert-Equal 2 $sync.ExitCode
+            Assert-Match 'contradict each other' $sync.Output
+        } finally { Remove-TestRoot $r }
+    }
+
     It 'tells postprocess.ps1 which mode produced the run' {
         $r = New-OrchestratorRoot -Label 'content-exec' -Behavior $downloadBehavior
         try {
