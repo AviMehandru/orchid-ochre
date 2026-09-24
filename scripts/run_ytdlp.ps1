@@ -203,6 +203,33 @@ param(
     #   archive would believe it.
     [Parameter(Mandatory = $false)][switch]$Refresh,
 
+    # --- The rest of the media description ---
+    # Frame-rate ceiling, applied the same way as -Quality: a predicate in
+    # the -f expression with an unfiltered fallback, so a video that has
+    # nothing at or under the ceiling still downloads. 0 = no ceiling.
+    [Parameter(Mandatory = $false)][ValidateRange(0, 1000)][int]$Fps = 0,
+    # Replaces the conf's --sub-langs "en.*" for this session. yt-dlp's own
+    # syntax, validated for shape in ytdl.ps1.
+    [Parameter(Mandatory = $false)][string]$SubLangs = "",
+    # --no-embed-chapters. The chapters stay in the info.json either way.
+    [Parameter(Mandatory = $false)][switch]$NoChapters,
+    # SponsorBlock category lists, validated in ytdl.ps1. -SponsorblockRemove
+    # changes the media bytes, which is why both are recorded in the
+    # manifest's run_settings -- see the note where that object is built.
+    [Parameter(Mandatory = $false)][string]$SponsorblockMark = "",
+    [Parameter(Mandatory = $false)][string]$SponsorblockRemove = "",
+
+    # --- How YouTube is reached ---
+    # None of these change what is kept, so none of them is recorded in
+    # effective_args, and the two that can carry secrets (the cookie path's
+    # CONTENTS and a proxy password) never reach a log line or a manifest.
+    # See "CONNECTION OPTIONS" below for where each one goes.
+    [Parameter(Mandatory = $false)][string]$CookiesFromBrowser = "",
+    [Parameter(Mandatory = $false)][string]$CookiesFile = "",
+    [Parameter(Mandatory = $false)][string]$Proxy = "",
+    [Parameter(Mandatory = $false)][ValidatePattern('^$|^(?i)\d+(\.\d+)?[kmg]?$')][string]$LimitRate = "",
+    [Parameter(Mandatory = $false)][ValidateSet("native", "aria2c")][string]$Downloader = "",
+
     # Base64-encoded JSON array of raw yt-dlp arguments, decoded below.
     # Encoded rather than passed as a [string[]] because `pwsh -File`
     # cannot bind an array at all -- see the long note at the bottom of
@@ -863,12 +890,31 @@ $mediaBaseName = if ($Mode -eq "audio-only") { "Final Audio" } else { "Final Vid
 # from turning "this video only exists in 1440p" into a failed download.
 $formatArgs = @()
 $heightFilter = if ($Quality -and $Quality -ne "best") { "[height<=$Quality]" } else { "" }
+# -Fps is the same kind of thing as -Quality -- a ceiling with a fallback --
+# so it rides in the same predicate rather than getting a mechanism of its
+# own. Chained predicates are ANDed by yt-dlp, and the unfiltered
+# alternatives after each "/" are what keep "nothing at or under 30 fps"
+# from becoming a failed download.
+#
+# Why a filter and not a --format-sort key (-S fps:30): the two pick the
+# same rendition on most YouTube uploads, and they differ exactly where
+# -Codec is involved. This script's rule is that CEILINGS are filters and
+# PREFERENCES are sort keys -- -Quality is a filter, -Codec is a sort --
+# so a ceiling is honoured first and the codec preference chooses among
+# what survives it. As a sort key, fps would land behind vcodec: in the -S
+# string, so on a video whose avc1 renditions are all 60 fps but whose vp9
+# ones include 30 fps, "--codec avc1 --fps 30" would hand back avc1 at
+# 60 fps -- the preference silently beating the ceiling. As a filter it
+# composes with --codec the way --quality already does. What the ceiling
+# can cost on a 60 fps upload is spelled out in ytdl.ps1's help.
+$fpsFilter    = if ($Fps -gt 0) { "[fps<=$Fps]" } else { "" }
+$videoFilter  = "$heightFilter$fpsFilter"
 switch ($Mode) {
     "video-only" {
         # bv* rather than bv: the * form allows a video-only rendition OR
         # the video half of a combined stream, so a source that publishes
         # no separate video-only track still works.
-        $formatArgs = @("-f", "bv*$heightFilter/bv*/b$heightFilter/b")
+        $formatArgs = @("-f", "bv*$videoFilter/bv*/b$videoFilter/b")
     }
     "audio-only" {
         # No height filter: a height predicate against an audio-only
@@ -876,8 +922,8 @@ switch ($Mode) {
         $formatArgs = @("-f", "ba/b")
     }
     default {
-        if ($heightFilter) {
-            $formatArgs = @("-f", "bv*$heightFilter+ba/b$heightFilter/bv*+ba/b")
+        if ($videoFilter) {
+            $formatArgs = @("-f", "bv*$videoFilter+ba/b$videoFilter/bv*+ba/b")
         }
         # No -f at all when the mode is "full" and no cap was asked for:
         # the conf's own "-f bv*+ba/b" is already exactly right, and
@@ -930,6 +976,29 @@ if ($NoMetadata) {
     # already covers and archive-viewer.py already handles.
     $skipArgs += @("--no-write-description", "--no-write-info-json")
 }
+
+# --- Subtitle languages, chapters, SponsorBlock ---
+# All four are yt-dlp's own options passed after the conf, so each simply
+# wins over the conf's value -- the conf keeps --sub-langs "en.*" and
+# --embed-chapters as the defaults a plain run gets, and nothing here
+# rewrites it.
+#
+# --no-embed-chapters is the explicit negation for the same reason the
+# component skips above are: the conf has already said --embed-chapters,
+# and only the negating flag can take that back.
+#
+# SponsorBlock is not a sidecar. -SponsorblockMark writes chapters into the
+# media file; -SponsorblockRemove re-cuts it, so the file in "Final files"
+# is no longer the one YouTube served. That is a legitimate thing to want
+# and a large departure from what the rest of this pipeline optimises for,
+# which is why both are recorded in run_settings below rather than only in
+# effective_args, and why the help text says the uncut streams survive in
+# "Pre-merge streams" (--keep-video is in the conf).
+$extraContentArgs = @()
+if ($SubLangs)           { $extraContentArgs += @("--sub-langs", $SubLangs) }
+if ($NoChapters)         { $extraContentArgs += "--no-embed-chapters" }
+if ($SponsorblockMark)   { $extraContentArgs += @("--sponsorblock-mark", $SponsorblockMark) }
+if ($SponsorblockRemove) { $extraContentArgs += @("--sponsorblock-remove", $SponsorblockRemove) }
 
 # --- No-media modes ---
 # --skip-download leaves nothing to merge and nothing to move into
@@ -1031,6 +1100,7 @@ $contentArgs += $sortArgs
 $contentArgs += $audioArgs
 $contentArgs += $containerArgs
 $contentArgs += $skipArgs
+$contentArgs += $extraContentArgs
 $contentArgs += $skipDownloadArgs
 $contentArgs += $refreshArgs
 $contentArgs += $outputArgs
@@ -1039,6 +1109,142 @@ $contentArgs += $passthroughArgs
 if ($contentArgs.Count -gt 0) {
     "-- Content options for this session (mode: $Mode): $($contentArgs -join ' ') --" | Tee-Object -FilePath $logFile -Append
 }
+
+# =====================================================================
+# CONNECTION OPTIONS
+# =====================================================================
+# Cookies, proxy, speed limit, external downloader: HOW this session talks
+# to YouTube, as opposed to WHAT it keeps. Three rules follow from that
+# distinction, and each is here because the obvious implementation breaks
+# it.
+#
+# 1. They reach every yt-dlp process that talks to YouTube, not just the
+#    download. The --workers enumeration pass needs cookies to list a
+#    private playlist; postprocess.ps1's comments pass re-extracts the
+#    video and needs them for a members-only one; the Channel Info refresh
+#    needs the proxy as much as anything else does. Passing them only to
+#    the main invocation -- which is all --ytdlp-arg could ever do -- gives
+#    a run whose video downloads and whose comments fail with "Sign in to
+#    confirm your age". -LimitRate and -Downloader are the exception: they
+#    govern moving bytes, and only the download moves any.
+#
+# 2. They are not content, so they are kept OUT of $contentArgs and
+#    therefore out of effective_args in every manifest. A manifest is part
+#    of the archive; the archive gets copied to other disks and other
+#    people. What run_settings records is only whether cookies were used
+#    at all, because "this was fetched signed in" does describe the
+#    content (members-only posts, age-gated videos, the Premium bitrate).
+#
+# 3. They reach postprocess.ps1 through the ENVIRONMENT, not its command
+#    line. Its command line is the --exec string, which yt-dlp prints to
+#    the session log verbatim ("[Exec] Executing command: ..."), so any
+#    proxy password placed there -- base64 or not -- would be in
+#    download.log and in every per-video video_complete.log copied from
+#    it. The environment is inherited by yt-dlp and by the --exec child
+#    alike, including under ForEach-Object -Parallel (runspaces share the
+#    process environment), and is not logged by anything.
+#
+# The proxy URL itself is still on yt-dlp's own command line, where any
+# local user who can list processes can read it. SECURITY.md records that
+# as an accepted risk rather than this comment pretending otherwise.
+
+# Must agree with the copy in ytdl.ps1; 040-run-ytdlp asserts this one.
+function Hide-ProxyCredentials {
+    param([string]$ProxyUrl)
+    return ($ProxyUrl -replace '(?<=://)[^/@]*@', '***@')
+}
+
+# ytdl.ps1 refuses both of these and names the option; re-checked because
+# this script is directly invocable, and the second one is a credentials
+# leak rather than a wrong result (see ytdl.ps1).
+if ($CookiesFromBrowser -and $CookiesFile) {
+    "ERROR: -CookiesFromBrowser and -CookiesFile are two sources for the same thing; yt-dlp would save the browser's entire cookie jar into the file. Pick one." |
+        Tee-Object -FilePath $logFile -Append
+    exit 2
+}
+if ($CookiesFile -and -not (Test-Path -LiteralPath $CookiesFile -PathType Leaf)) {
+    "ERROR: -CookiesFile: no such file: $CookiesFile" | Tee-Object -FilePath $logFile -Append
+    exit 2
+}
+
+# --- Private copies of a cookies.txt ---
+# yt-dlp does not only READ a --cookies file: on exit it SAVES its whole
+# cookie jar back to that path, with a plain truncate-and-write. Handing
+# every yt-dlp process the user's own file would therefore mean (a) the
+# pipeline rewriting a credentials file it was only asked to read, and
+# (b) under -Workers N, N processes truncating and rewriting the same file
+# whenever their exits happen to coincide -- a corrupted cookies.txt, and
+# the next session failing to sign in with nothing in any log saying why.
+#
+# So every yt-dlp invocation gets its OWN copy, made immediately before
+# and deleted immediately after. On Linux and macOS the copy is chmod 600
+# BEFORE a byte is written into it, so there is no window in which the
+# cookies sit in a world-readable file in /tmp; on Windows the per-user
+# temp directory is already private to the user.
+#
+# Defined as a string as well as a function because ForEach-Object
+# -Parallel runspaces do not inherit functions; the worker block rebuilds
+# it from $cookieCopyFnSource rather than carrying a second copy of the
+# body that could drift from this one.
+$cookieCopyFnSource = @'
+param([string]$Source)
+$dest = Join-Path ([System.IO.Path]::GetTempPath()) ("ytdl-cookies-" + [guid]::NewGuid().ToString("N") + ".txt")
+[System.IO.File]::WriteAllBytes($dest, [byte[]]@())
+if (-not $IsWindows) { & chmod 600 -- $dest }
+[System.IO.File]::WriteAllBytes($dest, [System.IO.File]::ReadAllBytes($Source))
+return $dest
+'@
+Set-Item -Path function:New-PrivateCookieCopy -Value ([scriptblock]::Create($cookieCopyFnSource))
+
+# A copy is deleted in a finally block, which does not run if the whole
+# process tree is killed -- which is exactly what every app's Cancel
+# button does. Anything older than a day is therefore swept at the start
+# of the next session. A day, not "everything", because a second ytdl
+# session started by hand in another terminal may be using its copies
+# right now.
+Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Filter "ytdl-cookies-*.txt" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+# The arguments every YouTube-facing yt-dlp invocation carries, EXCEPT the
+# cookie file, which is added per invocation as a fresh copy.
+$networkArgs = @()
+if ($CookiesFromBrowser) { $networkArgs += @("--cookies-from-browser", $CookiesFromBrowser) }
+if ($Proxy)              { $networkArgs += @("--proxy", $Proxy) }
+
+# Download invocations only.
+$transferArgs = @()
+if ($LimitRate)  { $transferArgs += @("--limit-rate", $LimitRate) }
+if ($Downloader) { $transferArgs += @("--downloader", $Downloader) }
+
+# Handed to postprocess.ps1 through the environment; see rule 3 above.
+# Always set, including to nothing, so a value left over in the parent
+# environment by an earlier session in the same shell cannot leak in.
+$connection = [ordered]@{
+    cookies_from_browser = $CookiesFromBrowser
+    cookies_file         = $CookiesFile
+    proxy                = $Proxy
+}
+$env:YTDL_CONNECTION_B64 = [System.Convert]::ToBase64String(
+    [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -InputObject $connection)))
+
+$connectionNotes = @()
+if ($CookiesFromBrowser) { $connectionNotes += "cookies from browser '$CookiesFromBrowser'" }
+if ($CookiesFile)        { $connectionNotes += "cookies from '$CookiesFile' (each yt-dlp process gets a private copy; the file itself is never written)" }
+if ($Proxy)              { $connectionNotes += "proxy $(Hide-ProxyCredentials $Proxy)" }
+if ($LimitRate)          { $connectionNotes += "speed limit $LimitRate per yt-dlp process" }
+if ($Downloader)         { $connectionNotes += "downloader $Downloader" }
+if ($connectionNotes.Count -gt 0) {
+    "-- Connection options for this session: $($connectionNotes -join '; ') --" | Tee-Object -FilePath $logFile -Append
+}
+if ($Downloader -eq "aria2c") {
+    "  NOTE: yt-dlp prints no '[download] NN%' progress lines through aria2c; the session is running even when nothing appears to move." |
+        Tee-Object -FilePath $logFile -Append
+}
+
+# =====================================================================
+# END CONNECTION OPTIONS
+# =====================================================================
 
 # Recorded into every manifest.json this session writes, so a video can be
 # traced back to the settings that produced it. config_file_version alone
@@ -1057,6 +1263,22 @@ $runSettings = [ordered]@{
     no_thumbnail  = [bool]$NoThumbnail
     no_metadata   = [bool]$NoMetadata
     refresh       = [bool]$Refresh
+    # The four below were added with the options themselves. New fields
+    # are backward-compatible under docs/archive-layout.md, so the layout
+    # version does not move; a reader that predates them sees a
+    # run_settings object with keys it does not know, which it already
+    # has to tolerate.
+    fps                 = if ($Fps -gt 0) { $Fps } else { $null }
+    sub_langs           = if ($SubLangs) { $SubLangs } else { $null }
+    no_chapters         = [bool]$NoChapters
+    sponsorblock_mark   = if ($SponsorblockMark) { $SponsorblockMark } else { $null }
+    # Non-null means the media file was re-cut and is not the file YouTube
+    # served. The field an archive reader should check before trusting a
+    # duration or a checksum against an outside copy.
+    sponsorblock_remove = if ($SponsorblockRemove) { $SponsorblockRemove } else { $null }
+    # Whether the video was fetched signed in, and how -- never the path,
+    # never the profile, never the cookies. See CONNECTION OPTIONS above.
+    cookies             = if ($CookiesFromBrowser) { "browser" } elseif ($CookiesFile) { "file" } else { $null }
     passthrough   = @($passthroughArgs)
     effective_args = @($contentArgs)
 }
@@ -1153,19 +1375,32 @@ if ($Workers -le 1) {
     # DEGRADED-MODE ARCHIVE HANDLING above for all three. @potArgs is empty
     # in a degraded session, which makes this invocation identical to the
     # pre-PO-token one.
-    & yt-dlp `
-        --ignore-config `
-        --config-location $confFile `
-        @archiveArgs `
-        --paths "home:$completeArchiveDir" `
-        --paths "temp:$incompleteDir" `
-        @jsRuntimeArgs `
-        @potArgs `
-        --exec $execCmd `
-        @contentArgs `
-        @playlistArgs `
-        -- `
-        $Url 2>&1 | Tee-Object -Variable sessionOutput | Tee-Object -FilePath $logFile -Append
+    #
+    # @networkArgs and @transferArgs sit BEFORE @contentArgs so that a
+    # --ytdlp-arg --proxy (the old way to do this, still accepted) keeps
+    # winning, exactly as it did before these options existed.
+    $cookieCopy = if ($CookiesFile) { New-PrivateCookieCopy -Source $CookiesFile } else { $null }
+    $cookieArgs = if ($cookieCopy) { @("--cookies", $cookieCopy) } else { @() }
+    try {
+        & yt-dlp `
+            --ignore-config `
+            --config-location $confFile `
+            @archiveArgs `
+            --paths "home:$completeArchiveDir" `
+            --paths "temp:$incompleteDir" `
+            @jsRuntimeArgs `
+            @potArgs `
+            @networkArgs `
+            @cookieArgs `
+            @transferArgs `
+            --exec $execCmd `
+            @contentArgs `
+            @playlistArgs `
+            -- `
+            $Url 2>&1 | Tee-Object -Variable sessionOutput | Tee-Object -FilePath $logFile -Append
+    } finally {
+        if ($cookieCopy) { Remove-Item -LiteralPath $cookieCopy -Force -ErrorAction SilentlyContinue }
+    }
 
     # --- Session summary ---
     # Best-effort, parsed from yt-dlp's own console text rather than any
@@ -1216,7 +1451,18 @@ if ($Workers -le 1) {
     # `--` before $Url for the same reason as the single-stream call above:
     # a channel or playlist URL is a positional argument, and one whose id
     # begins with a hyphen must not be read as an option.
-    $enumOutput = & yt-dlp --ignore-config --flat-playlist --skip-download --print "%(id)s" @enumArgs -- $Url 2>&1
+    #
+    # @networkArgs because a private or members-only playlist cannot be
+    # listed without the cookies that will later be used to download it --
+    # and an enumeration that returns nothing reads, further down, as
+    # "nothing to dispatch" rather than as a sign-in failure.
+    $enumCookieCopy = if ($CookiesFile) { New-PrivateCookieCopy -Source $CookiesFile } else { $null }
+    $enumCookieArgs = if ($enumCookieCopy) { @("--cookies", $enumCookieCopy) } else { @() }
+    try {
+        $enumOutput = & yt-dlp --ignore-config --flat-playlist --skip-download --print "%(id)s" @networkArgs @enumCookieArgs @enumArgs -- $Url 2>&1
+    } finally {
+        if ($enumCookieCopy) { Remove-Item -LiteralPath $enumCookieCopy -Force -ErrorAction SilentlyContinue }
+    }
     $enumOutput | ForEach-Object { "  [enumerate] $_" | Tee-Object -FilePath $logFile -Append }
     # yt-dlp's --print output is one id per line; anything else mixed into
     # 2>&1 (warnings, progress) won't match this shape, so a simple filter
@@ -1345,6 +1591,14 @@ if ($Workers -le 1) {
             # once, not once per video.
             $contentArgs   = $using:contentArgs
             $ppExtraArgs   = $using:ppExtraArgs
+            # Connection options: decided once, like everything above. The
+            # cookie file is the one per-invocation thing, because each
+            # worker's yt-dlp must get a copy of its own -- see
+            # New-PrivateCookieCopy for why sharing one is a corruption bug.
+            $networkArgs   = $using:networkArgs
+            $transferArgs  = $using:transferArgs
+            $cookiesFile   = $using:CookiesFile
+            Set-Item -Path function:New-PrivateCookieCopy -Value ([scriptblock]::Create($using:cookieCopyFnSource))
 
             $workerLogName = "download.worker-$id.log"
             $workerLogFile = Join-Path $logsDir $workerLogName
@@ -1362,18 +1616,27 @@ if ($Workers -le 1) {
 
             "==== Download session started (worker, video $id) $(Get-Date -Format o) ====" | Set-Content -Path $workerLogFile
 
-            & yt-dlp `
-                --ignore-config `
-                --config-location $confFile `
-                @archiveArgs `
-                --paths "home:$completeArchiveDir" `
-                --paths "temp:$incompleteDir" `
-                @jsRuntimeArgs `
-                @potArgs `
-                --exec $workerExecCmd `
-                @contentArgs `
-                -- `
-                $videoUrl 2>&1 | Tee-Object -Variable workerOutput | Add-Content -Path $workerLogFile
+            $cookieCopy = if ($cookiesFile) { New-PrivateCookieCopy -Source $cookiesFile } else { $null }
+            $cookieArgs = if ($cookieCopy) { @("--cookies", $cookieCopy) } else { @() }
+            try {
+                & yt-dlp `
+                    --ignore-config `
+                    --config-location $confFile `
+                    @archiveArgs `
+                    --paths "home:$completeArchiveDir" `
+                    --paths "temp:$incompleteDir" `
+                    @jsRuntimeArgs `
+                    @potArgs `
+                    @networkArgs `
+                    @cookieArgs `
+                    @transferArgs `
+                    --exec $workerExecCmd `
+                    @contentArgs `
+                    -- `
+                    $videoUrl 2>&1 | Tee-Object -Variable workerOutput | Add-Content -Path $workerLogFile
+            } finally {
+                if ($cookieCopy) { Remove-Item -LiteralPath $cookieCopy -Force -ErrorAction SilentlyContinue }
+            }
 
             "==== Download session finished (worker, video $id) $(Get-Date -Format o) ====" | Add-Content -Path $workerLogFile
 

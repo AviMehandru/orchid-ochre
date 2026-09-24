@@ -81,6 +81,16 @@ param(
     [Parameter(Mandatory = $false)][ValidateRange(1, 10000)][int]$MaxEntries = 500,
     [Parameter(Mandatory = $false)][ValidateRange(1024, 65535)][int]$PotPort = 4416,
     [Parameter(Mandatory = $false)][switch]$NoPot,
+    # The connection options a probe honours, because each changes what
+    # yt-dlp can SEE: a members-only video, a geo-blocked one, the Premium
+    # bitrate formats. A preview taken without them would describe a
+    # different video from the one the download gets -- the one direction
+    # a preview must not be wrong in. --limit-rate and --downloader are
+    # refused by ytdl.ps1 before this script is reached; a probe moves no
+    # media bytes for them to govern.
+    [Parameter(Mandatory = $false)][string]$CookiesFromBrowser = "",
+    [Parameter(Mandatory = $false)][string]$CookiesFile = "",
+    [Parameter(Mandatory = $false)][string]$Proxy = "",
     [Parameter(Mandatory = $false)][string]$YtdlpArgsB64 = ""
 )
 
@@ -233,6 +243,21 @@ if ($YtdlpArgsB64) {
 # -- of the video itself, or of a playlist's first entry -- for the format
 # table. Two calls, bounded, regardless of how large the playlist is.
 
+# Cookies and proxy, BEFORE the passthrough so a --ytdlp-arg --proxy still
+# wins as it always did. The cookie FILE is not here: yt-dlp writes its jar
+# back to that path on exit, so each call below gets a private copy of its
+# own instead -- see Invoke-YtDlpJson, and New-PrivateCookieCopy in
+# run_ytdlp.ps1 for the full reasoning.
+if ($CookiesFromBrowser -and $CookiesFile) {
+    Fail "-CookiesFromBrowser and -CookiesFile are two sources for the same thing. Pick one."
+}
+if ($CookiesFile -and -not (Test-Path -LiteralPath $CookiesFile -PathType Leaf)) {
+    Fail "-CookiesFile: no such file: $CookiesFile"
+}
+$networkArgs = @()
+if ($CookiesFromBrowser) { $networkArgs += @("--cookies-from-browser", $CookiesFromBrowser) }
+if ($Proxy)              { $networkArgs += @("--proxy", $Proxy) }
+
 # Retries deliberately far below the conf's. A person is watching this.
 $commonArgs = @(
     "--ignore-config",
@@ -240,7 +265,7 @@ $commonArgs = @(
     "--socket-timeout", "15",
     "--retries", "2",
     "--extractor-retries", "2"
-) + $jsRuntimeArgs + $potArgs + $passthroughArgs
+) + $jsRuntimeArgs + $potArgs + $networkArgs + $passthroughArgs
 
 # --playlist-items caps enumeration on yt-dlp's side rather than ours, so
 # a 4,000-entry channel is never materialised in memory here. The user's
@@ -259,7 +284,16 @@ function Invoke-YtDlpJson {
     # `--` before the URL at every call site, same as run_ytdlp.ps1: about
     # one YouTube id in thirty starts with "-" or "_", and without the
     # end-of-options marker yt-dlp binds it as an option.
-    $argv = @("-J") + $commonArgs + $ExtraArgs + @("--", $TargetUrl)
+    $cookieCopy = $null
+    if ($CookiesFile) {
+        # A private, chmod-600 copy per call, deleted in the finally below.
+        $cookieCopy = Join-Path ([System.IO.Path]::GetTempPath()) ("ytdl-cookies-" + [guid]::NewGuid().ToString("N") + ".txt")
+        [System.IO.File]::WriteAllBytes($cookieCopy, [byte[]]@())
+        if (-not $IsWindows) { & chmod 600 -- $cookieCopy }
+        [System.IO.File]::WriteAllBytes($cookieCopy, [System.IO.File]::ReadAllBytes($CookiesFile))
+    }
+    $cookieArgs = if ($cookieCopy) { @("--cookies", $cookieCopy) } else { @() }
+    $argv = @("-J") + $commonArgs + $cookieArgs + $ExtraArgs + @("--", $TargetUrl)
 
     $errFile = [System.IO.Path]::GetTempFileName()
     try {
@@ -277,6 +311,7 @@ function Invoke-YtDlpJson {
         $stderr = (Get-Content -Raw -LiteralPath $errFile -ErrorAction SilentlyContinue)
     } finally {
         Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        if ($cookieCopy) { Remove-Item -LiteralPath $cookieCopy -Force -ErrorAction SilentlyContinue }
     }
 
     if ($code -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) {

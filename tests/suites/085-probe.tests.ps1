@@ -373,8 +373,10 @@ Set-Content -LiteralPath '$marker' -Value 'started'
         $env:YTDLP_TEST_PROBE_KIND = 'playlist'
         $env:YTDLP_TEST_PROBE_ENTRIES = '3'
         # --items narrows enumeration, --no-pot and --pot-port change which
-        # formats yt-dlp can see, and --ytdlp-arg is how a URL that needs
-        # cookies gets probed at all.
+        # formats yt-dlp can see, and --ytdlp-arg still reaches yt-dlp for
+        # anything this parser has no option of its own for. (Cookies do
+        # have one now -- see the next test -- but the passthrough route
+        # must keep working for everything that does not.)
         $p = Invoke-Probe -Arguments @(
             'https://www.youtube.com/playlist?list=PL123', '--probe',
             '--items', '2-3', '--no-pot', '--pot-port', '5000',
@@ -392,6 +394,35 @@ Set-Content -LiteralPath '$marker' -Value 'started'
         $pi = [Array]::IndexOf([string[]]$flat.args, '--playlist-items')
         Assert-True ($pi -ge 0) '--playlist-items should be passed'
         Assert-Equal '2-3' $flat.args[$pi + 1] 'the range the user gave'
+    }
+
+    It 'reads the URL signed in and through the proxy when asked to, on both calls' {
+        # Cookies and a proxy change what yt-dlp can SEE: a members-only
+        # video, a geo-blocked one, the Premium bitrate formats. Both the
+        # flat call and the full extraction must carry them, or the format
+        # table and the entry list would describe two different views of
+        # the same URL.
+        Remove-Item Env:YTDLP_TEST_PROBE_KIND -ErrorAction SilentlyContinue
+        Clear-StubCalls -TestRoot $root
+        $cookies = Join-Path $root.Root 'probe-cookies.txt'
+        Set-Content -LiteralPath $cookies -Value '# Netscape HTTP Cookie File'
+        $p = Invoke-Probe -Arguments @($url, '--probe', '--cookies', $cookies, '--proxy', 'http://u:pw@p.example:3128')
+        Assert-Equal 0 $p.Raw.ExitCode ($p.Raw.Output -join ' ')
+        Assert-True ($null -ne $p.Json) 'no document came back'
+
+        $calls = @(Get-StubCalls -TestRoot $root -Name 'yt-dlp' | Where-Object { $_.args -contains '-J' })
+        Assert-True ($calls.Count -ge 2) 'expected the flat call and the full extraction'
+        foreach ($c in $calls) {
+            Assert-Equal 'http://u:pw@p.example:3128' $c.args[[array]::IndexOf($c.args, '--proxy') + 1]
+            $copy = $c.args[[array]::IndexOf($c.args, '--cookies') + 1]
+            Assert-NotEqual $cookies $copy 'yt-dlp writes its jar back on exit; it must be handed a copy'
+            Assert-PathMissing $copy 'each call''s copy must be deleted when the call ends'
+        }
+
+        $b = Invoke-Probe -Arguments @($url, '--probe', '--cookies-from-browser', 'firefox')
+        Assert-Equal 0 $b.Raw.ExitCode ($b.Raw.Output -join ' ')
+        $last = @(Get-StubCalls -TestRoot $root -Name 'yt-dlp' | Where-Object { $_.args -contains '-J' })[-1]
+        Assert-Equal 'firefox' $last.args[[array]::IndexOf($last.args, '--cookies-from-browser') + 1]
     }
 
     It 'reads yt-dlp without the download config' {

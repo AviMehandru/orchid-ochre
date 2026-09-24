@@ -518,6 +518,196 @@ the throttle silently never engages on Linux or macOS.
         } finally { Remove-TestRoot $r }
     }
 
+    # -----------------------------------------------------------------
+    # The options that used to be reachable only through --ytdlp-arg
+    # -----------------------------------------------------------------
+
+    # Decodes the run_settings object this session hands postprocess.ps1,
+    # which is what ends up in every manifest.json it writes.
+    function Get-RunSettingsFromExec {
+        param($Call)
+        $exec = $Call.args[[array]::IndexOf($Call.args, '--exec') + 1]
+        if ($exec -notmatch '-RunSettingsB64 "([^"]+)"') { return $null }
+        return ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Matches[1])) | ConvertFrom-Json)
+    }
+
+    It 'applies a frame-rate ceiling the same way as a height cap, fallback included' {
+        # A filter, not a sort key: see the -Fps comment in run_ytdlp.ps1
+        # for the codec interaction that decided it. The unfiltered
+        # alternative at the end is what keeps "nothing at or under 30 fps"
+        # from becoming a failed download.
+        $r = New-OrchestratorRoot -Label 'fps' -Behavior $downloadBehavior
+        try {
+            $null = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-Quality', '720', '-Fps', '30')
+            $call = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                      Where-Object { $_.args -contains '--config-location' })[-1]
+            $f = $call.args[[array]::IndexOf($call.args, '-f') + 1]
+            Assert-Equal 'bv*[height<=720][fps<=30]+ba/b[height<=720][fps<=30]/bv*+ba/b' $f `
+                'both ceilings in one predicate, then the unfiltered fallback'
+
+            Clear-StubCalls -TestRoot $r
+            $null = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' -ExtraArgs @('-Fps', '30')
+            $call = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                      Where-Object { $_.args -contains '--config-location' })[-1]
+            Assert-Equal 'bv*[fps<=30]+ba/b[fps<=30]/bv*+ba/b' $call.args[[array]::IndexOf($call.args, '-f') + 1] `
+                'a frame-rate ceiling on its own must still produce a selector'
+            Assert-False ($call.args -contains '-S') 'a ceiling must not become a sort key'
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'passes subtitle languages, chapters and SponsorBlock after the conf so they win' {
+        $r = New-OrchestratorRoot -Label 'media-extra' -Behavior $downloadBehavior
+        try {
+            $null = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-SubLangs', 'en.*,de,-live_chat', '-NoChapters',
+                             '-SponsorblockRemove', 'sponsor,selfpromo')
+            $call = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                      Where-Object { $_.args -contains '--config-location' })[-1]
+            $confIdx = [array]::IndexOf($call.args, '--config-location')
+            foreach ($pair in @(@('--sub-langs', 'en.*,de,-live_chat'),
+                                @('--sponsorblock-remove', 'sponsor,selfpromo'))) {
+                $idx = [array]::IndexOf($call.args, $pair[0])
+                Assert-True ($idx -gt $confIdx) "$($pair[0]) must come after --config-location to override the conf"
+                Assert-Equal $pair[1] $call.args[$idx + 1]
+            }
+            Assert-True ($call.args -contains '--no-embed-chapters') `
+                'the conf says --embed-chapters, and only the negation can take that back'
+
+            $rs = Get-RunSettingsFromExec $call
+            Assert-Equal 'en.*,de,-live_chat' $rs.sub_langs
+            Assert-True $rs.no_chapters
+            Assert-Equal 'sponsor,selfpromo' $rs.sponsorblock_remove `
+                'a re-cut media file must say so in its manifest'
+            Assert-True ($null -eq $rs.sponsorblock_mark)
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'keeps a default run free of every new option' {
+        $r = New-OrchestratorRoot -Label 'new-defaults' -Behavior $downloadBehavior
+        try {
+            $run = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01'
+            $call = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                      Where-Object { $_.args -contains '--config-location' })[-1]
+            foreach ($flag in @('--sub-langs', '--no-embed-chapters', '--sponsorblock-mark',
+                                '--sponsorblock-remove', '--cookies', '--cookies-from-browser',
+                                '--proxy', '--limit-rate', '--downloader')) {
+                Assert-False ($call.args -contains $flag) "$flag must not appear unless asked for"
+            }
+            Assert-NotMatch 'Connection options' ($run.Output -join "`n")
+            $rs = Get-RunSettingsFromExec $call
+            Assert-True ($null -eq $rs.cookies) 'an anonymous run records cookies as null'
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'keeps connection options out of the manifest and masks a proxy password in the log' {
+        # A manifest is part of the archive, and the archive gets copied.
+        # The --exec string is printed into download.log by yt-dlp itself.
+        # Neither may carry the proxy, and the log line this script writes
+        # about the proxy must not carry its password.
+        $r = New-OrchestratorRoot -Label 'conn-private' -Behavior $downloadBehavior
+        try {
+            $run = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-Proxy', 'socks5://archivist:hunter2@127.0.0.1:1080',
+                             '-CookiesFromBrowser', 'firefox', '-LimitRate', '2M')
+            $call = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                      Where-Object { $_.args -contains '--config-location' })[-1]
+
+            # It must still reach yt-dlp, whole.
+            Assert-Equal 'socks5://archivist:hunter2@127.0.0.1:1080' $call.args[[array]::IndexOf($call.args, '--proxy') + 1]
+            Assert-Equal 'firefox' $call.args[[array]::IndexOf($call.args, '--cookies-from-browser') + 1]
+            Assert-Equal '2M' $call.args[[array]::IndexOf($call.args, '--limit-rate') + 1]
+
+            $log = $run.Output -join "`n"
+            Assert-Match 'proxy socks5://\*\*\*@127\.0\.0\.1:1080' $log 'the proxy is named in the log, masked'
+            Assert-NotMatch 'hunter2' $log 'the password must appear in no log line this script writes'
+
+            $exec = $call.args[[array]::IndexOf($call.args, '--exec') + 1]
+            Assert-NotMatch 'hunter2|archivist|--proxy' $exec 'the exec string is logged by yt-dlp verbatim'
+            $execDecoded = if ($exec -match '-RunSettingsB64 "([^"]+)"') {
+                [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Matches[1]))
+            } else { '' }
+            Assert-NotMatch 'hunter2|--proxy|--limit-rate|--cookies' $execDecoded `
+                'connection options are not content and must not reach effective_args'
+            $rs = $execDecoded | ConvertFrom-Json
+            Assert-Equal 'browser' $rs.cookies 'whether the video was fetched signed in IS recorded'
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'hands yt-dlp a private copy of a cookie file, never the file itself' {
+        # yt-dlp writes its cookie jar back to the --cookies path on exit.
+        # This stub does the same, so the test fails if the user's own file
+        # is ever the one handed over.
+        $cookieBehavior = {
+            if ($StubArgs -contains '--version') { Write-Output '2026.08.20'; return }
+            $i = [array]::IndexOf($StubArgs, '--cookies')
+            if ($i -ge 0) {
+                $p = $StubArgs[$i + 1]
+                Write-Output "COOKIE-CONTENT: $((Get-Content -LiteralPath $p -Raw).Trim())"
+                if (-not $IsWindows) { Write-Output "COOKIE-MODE: $((Get-Item -LiteralPath $p).UnixMode)" }
+                Set-Content -LiteralPath $p -Value 'jar saved by yt-dlp on exit'
+            }
+            Write-Output '[youtube] testVideo01: Downloading webpage'
+        }
+        $r = New-OrchestratorRoot -Label 'cookie-copy' -Behavior $cookieBehavior
+        try {
+            $cookies = Join-Path $r.Root 'cookies.txt'
+            Set-Content -LiteralPath $cookies -Value '# Netscape HTTP Cookie File' -Encoding utf8
+            $run = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' -ExtraArgs @('-CookiesFile', $cookies)
+            $call = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                      Where-Object { $_.args -contains '--config-location' })[-1]
+            $handed = $call.args[[array]::IndexOf($call.args, '--cookies') + 1]
+
+            Assert-NotEqual $cookies $handed 'the user''s own cookie file must never be handed to yt-dlp'
+            Assert-Match 'COOKIE-CONTENT: # Netscape HTTP Cookie File' ($run.Output -join "`n") 'the copy must hold the same cookies'
+            if (-not $IsWindows) {
+                Assert-Match 'COOKIE-MODE: -rw-------' ($run.Output -join "`n") 'the copy must be readable by its owner only'
+            }
+            Assert-Equal '# Netscape HTTP Cookie File' ((Get-Content -LiteralPath $cookies -Raw).Trim()) `
+                'yt-dlp saving its jar must not touch the original'
+            Assert-PathMissing $handed 'the copy must be deleted when the invocation ends'
+            $rs = Get-RunSettingsFromExec $call
+            Assert-Equal 'file' $rs.cookies
+            Assert-NotMatch ([regex]::Escape($cookies)) (ConvertTo-Json -Compress -InputObject $rs) `
+                'the cookie path is not the archive''s business'
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'hands postprocess.ps1 the connection through the environment' {
+        # The comments pass and the Channel Info refresh talk to YouTube on
+        # their own, and need the same cookies and proxy. They get them
+        # from YTDL_CONNECTION_B64, not from the logged --exec string.
+        $envBehavior = {
+            if ($StubArgs -contains '--version') { Write-Output '2026.08.20'; return }
+            Write-Output "CONN-ENV: $env:YTDL_CONNECTION_B64"
+        }
+        $r = New-OrchestratorRoot -Label 'conn-env' -Behavior $envBehavior
+        try {
+            $run = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-Proxy', 'http://proxy.example:3128', '-CookiesFromBrowser', 'chrome:Profile 1')
+            $line = @($run.Output | Where-Object { $_ -match '^CONN-ENV: (.+)$' })[0]
+            Assert-True ($null -ne $line) 'yt-dlp -- and therefore its --exec child -- must inherit the connection'
+            $null = $line -match '^CONN-ENV: (.+)$'
+            $conn = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Matches[1])) | ConvertFrom-Json
+            Assert-Equal 'http://proxy.example:3128' $conn.proxy
+            Assert-Equal 'chrome:Profile 1' $conn.cookies_from_browser
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'refuses two cookie sources at once, even when invoked directly' {
+        $r = New-OrchestratorRoot -Label 'conn-both' -Behavior $downloadBehavior
+        try {
+            $cookies = Join-Path $r.Root 'cookies.txt'
+            Set-Content -LiteralPath $cookies -Value '# Netscape HTTP Cookie File'
+            $run = Invoke-RunYtdlp -TestRoot $r -Url 'https://youtu.be/testVideo01' `
+                -ExtraArgs @('-CookiesFile', $cookies, '-CookiesFromBrowser', 'firefox')
+            Assert-NotEqual 0 $run.ExitCode
+            Assert-Match 'two sources for the same thing' ($run.Output -join "`n")
+            Assert-Equal 0 @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' |
+                             Where-Object { $_.args -contains '--config-location' }).Count
+        } finally { Remove-TestRoot $r }
+    }
+
 }
 
 Describe 'run_ytdlp.ps1 parallel dispatch' {
@@ -684,6 +874,39 @@ element and the last one. The guard for `$cutIndex -eq 0 has regressed.
                 Assert-True ($d.args -contains '--no-write-subs') `
                     'a worker download must carry the component skips'
             }
+        } finally { Remove-TestRoot $r }
+    }
+
+    It 'gives every worker the connection options and a cookie copy of its own' {
+        # N workers sharing one --cookies path means N processes rewriting
+        # it at exit. Each must get a distinct copy, and the enumeration
+        # pass needs the cookies too -- a private playlist cannot be listed
+        # without them.
+        $env:YTDLP_TEST_IDS = 'aaa111,bbb222,ccc333'
+        $r = New-ParallelRoot -Label 'parallel-conn'
+        try {
+            $cookies = Join-Path $r.Root 'cookies.txt'
+            Set-Content -LiteralPath $cookies -Value '# Netscape HTTP Cookie File'
+            $null = Invoke-RunYtdlp -TestRoot $r -Url 'https://www.youtube.com/@chan/videos' `
+                -ExtraArgs @('-Workers', '3', '-CookiesFile', $cookies, '-Proxy', 'http://p.example:8080',
+                             '-LimitRate', '500K', '-Downloader', 'native')
+            $calls = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp')
+            $enum = @($calls | Where-Object { $_.args -contains '--flat-playlist' })[0]
+            Assert-True ($enum.args -contains '--cookies') 'enumeration must be signed in too'
+            Assert-True ($enum.args -contains '--proxy')
+            Assert-False ($enum.args -contains '--limit-rate') 'enumeration moves no media bytes'
+
+            $downloads = @($calls | Where-Object { $_.args -contains '--download-archive' })
+            Assert-Equal 3 $downloads.Count
+            $copies = @($downloads | ForEach-Object { $_.args[[array]::IndexOf($_.args, '--cookies') + 1] })
+            Assert-Equal 3 @($copies | Sort-Object -Unique).Count 'every worker must get a cookie copy of its own'
+            Assert-False ($copies -contains $cookies) 'no worker may be handed the original'
+            foreach ($d in $downloads) {
+                Assert-Equal '500K' $d.args[[array]::IndexOf($d.args, '--limit-rate') + 1]
+                Assert-Equal 'native' $d.args[[array]::IndexOf($d.args, '--downloader') + 1]
+                Assert-True ($d.args -contains '--proxy')
+            }
+            foreach ($c in $copies) { Assert-PathMissing $c 'every worker''s copy must be cleaned up' }
         } finally { Remove-TestRoot $r }
     }
 

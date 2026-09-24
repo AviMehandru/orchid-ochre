@@ -155,6 +155,31 @@ if this were ever wrapped by something with a different trust boundary
 (e.g. a shared service invoking `ytdl` on other people's behalf) — not the
 case today.
 
+### 6. A proxy password is visible in the process list (run_ytdlp.ps1, probe.ps1)
+
+`--proxy user:password@host` is handed to yt-dlp as a command-line
+argument, and on Linux and macOS any local account can read another
+process's arguments (`ps -ef`, `/proc/<pid>/cmdline`). The password is
+masked as `***@` in every log line this pipeline writes, and it reaches
+`postprocess.ps1` through the environment rather than the `--exec`
+string precisely because yt-dlp prints that string into `download.log` —
+but the argument itself is on yt-dlp's command line for as long as the
+download runs.
+
+**Severity**: Low on the single-user VM this runs on. The alternative is
+to pass the proxy to yt-dlp through `HTTPS_PROXY`/`ALL_PROXY` instead,
+which yt-dlp honours only for some schemes and some code paths; a proxy
+that silently applies to some requests and not others is worse than one
+whose password a local user could read. If that trade ever changes, the
+change is in `$networkArgs` in `run_ytdlp.ps1` and `probe.ps1`.
+
+The related decision that did NOT make this list: a `--cookies` file is
+never handed to yt-dlp directly (yt-dlp writes its jar back to that path
+on exit). Each process gets a private copy in the temp directory, created
+`chmod 600` before any cookie is written into it and deleted when the
+process ends; a copy orphaned by a killed session is swept after a day.
+On Windows the per-user temp directory is already private.
+
 ## Summary
 
 | # | Issue | File | Severity |
@@ -164,6 +189,7 @@ case today.
 | 3 | Predictable `/tmp` filenames | `setup.sh` | Low (single-user VM) |
 | 4 | `allow_other` on shared mount | `setup.sh` | Low (single-user VM) |
 | 5 | No `-DataRoot` path validation | `run_ytdlp.ps1` | Informational only |
+| 6 | Proxy password in the process list | `run_ytdlp.ps1`, `probe.ps1` | Low (single-user VM) |
 
 ## What implementing these fixes would actually involve
 
@@ -209,6 +235,13 @@ A more realistic version would be a denylist of obviously-wrong targets
 (`/etc`, `/root`, `/boot`, system paths) rather than a strict allowlist.
 Worth doing only if this pipeline ever gets invoked by anything other than
 you typing the command yourself.
+
+**#6 (proxy password in the process list) — a trade, not a fix.** Moving
+the proxy into yt-dlp's environment would hide it from `ps`, at the cost
+of a proxy that yt-dlp applies unevenly across schemes and code paths.
+The practical mitigation is outside this repo: a proxy that authenticates
+by source address, or one listening on localhost, needs no password in
+the URL at all.
 
 **Bottom line**: #2 is worth doing regardless — it's cheap and it protects
 the one binary that runs on every single invocation. #1 and #3 are easy

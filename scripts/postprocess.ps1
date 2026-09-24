@@ -97,6 +97,51 @@ $installRoot = if ([string]::IsNullOrWhiteSpace($env:YTDLP_INSTALL_ROOT)) {
 # END PLATFORM RESOLUTION
 # =====================================================================
 
+# --- Connection options inherited from the session ---
+# Cookies and proxy for the two passes below that talk to YouTube on their
+# own -- the comments pass and the Channel Info refresh. They arrive in the
+# ENVIRONMENT (YTDL_CONNECTION_B64, set by run_ytdlp.ps1) rather than as a
+# parameter, because this script's command line is the --exec string, and
+# yt-dlp prints that string into the session log verbatim. See CONNECTION
+# OPTIONS in run_ytdlp.ps1 for the whole argument.
+#
+# Absent when this script is run by hand against an existing file, which
+# is the documented repair path: both passes then run without cookies or
+# proxy, exactly as they did before these options existed.
+$connNetworkArgs = @()
+$connCookiesFile = ""
+if ($env:YTDL_CONNECTION_B64) {
+    try {
+        $conn = [System.Text.Encoding]::UTF8.GetString(
+            [System.Convert]::FromBase64String($env:YTDL_CONNECTION_B64)) | ConvertFrom-Json
+        if ($conn.cookies_from_browser) { $connNetworkArgs += @("--cookies-from-browser", $conn.cookies_from_browser) }
+        if ($conn.proxy)                { $connNetworkArgs += @("--proxy", $conn.proxy) }
+        if ($conn.cookies_file -and (Test-Path -LiteralPath $conn.cookies_file -PathType Leaf)) {
+            $connCookiesFile = $conn.cookies_file
+        }
+    } catch {
+        # Not fatal: the media is already downloaded by the time this runs.
+        # The comments pass will fail visibly if it needed a sign-in, and
+        # that failure is logged and audited like any other.
+        $connNetworkArgs = @()
+        $connCookiesFile = ""
+    }
+}
+
+# yt-dlp saves its cookie jar back to a --cookies path on exit, so each
+# pass gets a private, chmod-600 copy, deleted as soon as it finishes. The
+# same body as New-PrivateCookieCopy in run_ytdlp.ps1, for the same
+# reasons -- the user's file is never written, and a --workers session's
+# concurrent postprocess instances never rewrite one file at once.
+function New-PassCookieArgs {
+    if (-not $connCookiesFile) { return [pscustomobject]@{ Args = @(); Copy = $null } }
+    $dest = Join-Path ([System.IO.Path]::GetTempPath()) ("ytdl-cookies-" + [guid]::NewGuid().ToString("N") + ".txt")
+    [System.IO.File]::WriteAllBytes($dest, [byte[]]@())
+    if (-not $IsWindows) { & chmod 600 -- $dest }
+    [System.IO.File]::WriteAllBytes($dest, [System.IO.File]::ReadAllBytes($connCookiesFile))
+    return [pscustomobject]@{ Args = @("--cookies", $dest); Copy = $dest }
+}
+
 # --- Cross-platform advisory file locking ---
 # Needed once postprocess.ps1 can run for several videos AT THE SAME TIME
 # (under run_ytdlp.ps1 -Workers N): several instances of this script can
@@ -622,21 +667,35 @@ try {
             # cost the comments of a video that had otherwise downloaded
             # perfectly -- a partial archive rather than a loud failure,
             # which is the worse of the two outcomes.
+            #
+            # @connNetworkArgs: cookies and proxy from the session. A
+            # members-only or age-gated video whose media downloaded signed
+            # in would otherwise come back here signed OUT, and its comments
+            # would fail with "Sign in to confirm your age" -- which is how
+            # this pass behaved when the only route to cookies was
+            # --ytdlp-arg, since passthrough arguments never reached it.
             $commentsSw = [System.Diagnostics.Stopwatch]::StartNew()
-            $commentsOutput = & yt-dlp `
-                --ignore-config `
-                --skip-download `
-                --write-comments `
-                --write-info-json `
-                --extractor-retries 100 `
-                --retry-sleep "extractor:exp=1:30:2" `
-                --sleep-requests 0.25 `
-                -o (Join-Path $commentsTempDir "comments.%(ext)s") `
-                -- `
-                $originalUrl 2>&1 | ForEach-Object {
-                    Log "  [comments] $_"
-                    $_
-                }
+            $commentsCookies = New-PassCookieArgs
+            try {
+                $commentsOutput = & yt-dlp `
+                    --ignore-config `
+                    --skip-download `
+                    --write-comments `
+                    --write-info-json `
+                    --extractor-retries 100 `
+                    --retry-sleep "extractor:exp=1:30:2" `
+                    --sleep-requests 0.25 `
+                    @connNetworkArgs `
+                    @($commentsCookies.Args) `
+                    -o (Join-Path $commentsTempDir "comments.%(ext)s") `
+                    -- `
+                    $originalUrl 2>&1 | ForEach-Object {
+                        Log "  [comments] $_"
+                        $_
+                    }
+            } finally {
+                if ($commentsCookies.Copy) { Remove-Item -LiteralPath $commentsCookies.Copy -Force -ErrorAction SilentlyContinue }
+            }
             $commentsSw.Stop()
 
             # --- Throttle / pacing telemetry ---
@@ -1271,17 +1330,27 @@ try {
                 # `--` again, same rule as the comments pass above. A channel
                 # URL built from a custom handle (/@-SomeChannel) is the case
                 # this one guards.
-                & yt-dlp `
-                    --ignore-config `
-                    --skip-download `
-                    --flat-playlist `
-                    --playlist-items 0 `
-                    --write-info-json `
-                    --write-all-thumbnails `
-                    --write-description `
-                    -o (Join-Path $channelInfoDir "channel.%(ext)s") `
-                    -- `
-                    $channelUrl 2>&1 | ForEach-Object { Log "  [channel-info] $_" }
+                # Cookies and proxy for the same reason as the comments
+                # pass: a proxy that the download needed, the channel page
+                # needs too.
+                $channelCookies = New-PassCookieArgs
+                try {
+                    & yt-dlp `
+                        --ignore-config `
+                        --skip-download `
+                        --flat-playlist `
+                        --playlist-items 0 `
+                        --write-info-json `
+                        --write-all-thumbnails `
+                        --write-description `
+                        @connNetworkArgs `
+                        @($channelCookies.Args) `
+                        -o (Join-Path $channelInfoDir "channel.%(ext)s") `
+                        -- `
+                        $channelUrl 2>&1 | ForEach-Object { Log "  [channel-info] $_" }
+                } finally {
+                    if ($channelCookies.Copy) { Remove-Item -LiteralPath $channelCookies.Copy -Force -ErrorAction SilentlyContinue }
+                }
 
                 Set-Content -Path $throttleMarker -Value (Get-Date -Format "o")
                 Log "Refreshed Channel Info for $uploader."

@@ -213,6 +213,63 @@ Describe 'postprocess.ps1 comments pass' {
         } finally { Remove-TestRoot $r }
     }
 
+    It 'signs the comments and Channel Info passes in the way the session was signed in' {
+        # A members-only video that downloaded with the session's cookies
+        # would otherwise have its comments fetched signed OUT -- which is
+        # exactly what happened when --ytdlp-arg was the only route to
+        # cookies, since passthrough arguments never reached this script.
+        # The connection arrives in the environment (run_ytdlp.ps1 sets it)
+        # because this script's command line is logged by yt-dlp.
+        $r = New-PostprocessRoot -Label 'pp-conn' -VideoArgs @{ SeedChannelInfoThrottle = $true }
+        $previous = $env:YTDL_CONNECTION_B64
+        try {
+            $marker = Join-Path $r.Video.ChannelDir 'Channel Info/.last_refresh'
+            (Get-Item -LiteralPath $marker -Force).LastWriteTime = (Get-Date).AddHours(-7)
+            $cookies = Join-Path $r.Root 'cookies.txt'
+            Set-Content -LiteralPath $cookies -Value '# Netscape HTTP Cookie File'
+            $env:YTDL_CONNECTION_B64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(
+                (ConvertTo-Json -Compress -InputObject ([ordered]@{
+                    cookies_from_browser = ''; cookies_file = $cookies; proxy = 'socks5://u:pw@127.0.0.1:1080' }))))
+
+            $result = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.MkvPath
+            $comments = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' | Where-Object { $_.args -contains '--write-comments' })[0]
+            $channel  = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' | Where-Object { $_.args -contains '--write-all-thumbnails' })[0]
+            foreach ($pass in @(@{ Name = 'comments'; Call = $comments }, @{ Name = 'Channel Info'; Call = $channel })) {
+                $c = $pass.Call
+                Assert-True ($null -ne $c) "the $($pass.Name) pass never ran"
+                Assert-Equal 'socks5://u:pw@127.0.0.1:1080' $c.args[[array]::IndexOf($c.args, '--proxy') + 1] `
+                    "the $($pass.Name) pass must use the session's proxy"
+                $copy = $c.args[[array]::IndexOf($c.args, '--cookies') + 1]
+                Assert-True ($null -ne $copy -and $copy -ne $cookies) `
+                    "the $($pass.Name) pass must get a private copy of the cookie file, not the file"
+                Assert-PathMissing $copy "the $($pass.Name) pass's cookie copy must be deleted afterwards"
+            }
+            Assert-NotMatch 'pw@' ($result.Output -join "`n") 'nothing this script logs may carry the proxy password'
+        } finally {
+            $env:YTDL_CONNECTION_B64 = $previous
+            Remove-TestRoot $r
+        }
+    }
+
+    It 'runs both passes anonymously when invoked by hand, with no session environment' {
+        # The documented manual-repair path. It must keep working with no
+        # new argument or variable to remember.
+        $r = New-PostprocessRoot -Label 'pp-conn-none' -VideoArgs @{ SeedChannelInfoThrottle = $true }
+        $previous = $env:YTDL_CONNECTION_B64
+        try {
+            $env:YTDL_CONNECTION_B64 = $null
+            $null = Invoke-Postprocess -TestRoot $r -FilePath $r.Video.MkvPath
+            $comments = @(Get-StubCalls -TestRoot $r -Name 'yt-dlp' | Where-Object { $_.args -contains '--write-comments' })[0]
+            Assert-True ($null -ne $comments)
+            foreach ($flag in @('--proxy', '--cookies', '--cookies-from-browser')) {
+                Assert-False ($comments.args -contains $flag) "$flag must not appear without a session"
+            }
+        } finally {
+            $env:YTDL_CONNECTION_B64 = $previous
+            Remove-TestRoot $r
+        }
+    }
+
     It 'merges the fetched comments into the sidecar info.json' {
         $r = New-PostprocessRoot -Label 'pp-comments-merge' -VideoArgs @{ SeedChannelInfoThrottle = $true }
         try {

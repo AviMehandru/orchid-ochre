@@ -380,6 +380,136 @@ Leaving it alone is what the rest of this pipeline optimises for.
 file is what triggers post-processing when there is no media file to trigger
 it. The run says so rather than silently producing nothing.
 
+### `--fps N`
+
+A frame-rate **ceiling**, in the same shape as `--quality`: a predicate in the
+format selector with an unfiltered fallback behind it, so a video with nothing
+at or under the ceiling still downloads.
+
+```bash
+ytdl "https://youtu.be/VIDEOID" --fps 30
+```
+
+Know what YouTube publishes before using it. A 60 fps upload is usually
+offered at 60 fps from 720p up and at 30 fps only below that, so `--fps 30`
+on such a video can mean **480p**. That is what "no more than 30 fps" means.
+
+It is a filter rather than a `--format-sort` key so that it composes with
+`--codec` the way `--quality` does: the ceiling is applied first and the codec
+preference chooses among what survives. As a sort key it would sit behind the
+codec preference and lose to it.
+
+### `--sub-langs LIST`
+
+Replaces the conf's `--sub-langs "en.*"` for this run. yt-dlp's own syntax —
+comma-separated codes or regexes, `all`, and `-` to exclude — with no spaces:
+
+```bash
+ytdl "https://youtu.be/VIDEOID" --sub-langs "en.*,de,-live_chat"
+
+# German captions for a video you already archived with English ones
+ytdl "https://youtu.be/VIDEOID" --mode subs-only --refresh --sub-langs de
+```
+
+Accepted with every `--mode` (subtitles are written in all of them). Refused
+with `--no-subs`. `--probe` reports which languages a video actually has.
+
+### `--no-chapters`
+
+Don't embed chapter markers into the media file. They stay in `info.json`.
+Refused with `--sponsorblock-mark`, which works by writing chapters.
+
+### `--sponsorblock-mark CATS`, `--sponsorblock-remove CATS`
+
+```bash
+ytdl "https://youtu.be/VIDEOID" --sponsorblock-mark all,-filler
+ytdl "https://youtu.be/VIDEOID" --sponsorblock-remove sponsor,selfpromo
+```
+
+Categories: `sponsor`, `intro`, `outro`, `selfpromo`, `preview`, `filler`,
+`interaction`, `music_offtopic`, `hook`, `poi_highlight`, `chapter`, `all`,
+`default`. A leading `-` excludes one. `poi_highlight` and `chapter` are points,
+not spans, and are refused by `--sponsorblock-remove`.
+
+**`mark` changes nothing but the chapter list. `remove` re-cuts the file**, so
+what is in `Final files/` is no longer what YouTube served. That can be exactly
+what you want, and it is a deliberate departure from the rest of this pipeline.
+It is never silent: `--keep-video` (in the conf) leaves the uncut streams in
+`Pre-merge streams/`, and the manifest records the cut in
+`run_settings.sponsorblock_remove`.
+
+`--fps`, `--no-chapters` and both SponsorBlock options describe the media file,
+so each is refused with a mode that downloads none.
+
+## How YouTube is reached
+
+None of these changes what is kept. They reach **every** yt-dlp process a
+session starts — the download, the `--workers` enumeration pass, and
+`postprocess.ps1`'s comments and Channel Info passes — except `--limit-rate` and
+`--downloader`, which only the download needs. That is the practical difference
+from passing the same yt-dlp options through `--ytdlp-arg`, which only ever
+reached the download: a members-only video would download signed in and then
+have its comments fetched signed out.
+
+### `--cookies-from-browser SPEC`, `--cookies FILE`
+
+```bash
+ytdl "https://youtu.be/VIDEOID" --cookies-from-browser firefox
+ytdl "https://youtu.be/VIDEOID" --cookies-from-browser "chrome+gnomekeyring:Profile 1"
+ytdl "https://youtu.be/VIDEOID" --cookies ~/cookies.txt
+```
+
+`SPEC` is yt-dlp's `BROWSER[+KEYRING][:PROFILE][::CONTAINER]`. The browser
+(`brave`, `chrome`, `chromium`, `edge`, `firefox`, `opera`, `safari`, `vivaldi`,
+`whale`) and keyring (`basictext`, `gnomekeyring`, `kwallet`, `kwallet5`,
+`kwallet6`) are checked here; the profile and container are passed on as given.
+
+**A cookie file is never written to.** yt-dlp saves its cookie jar back to the
+`--cookies` path on exit, so every yt-dlp process this pipeline starts is given
+a private copy (`chmod 600` on Linux and macOS) that is deleted when that
+process ends. Handing over the real file would mean the pipeline rewriting a
+credentials file it was only asked to read — and, under `--workers N`, N
+processes rewriting it at once. A copy orphaned by a killed session is swept
+at the start of the next one, once it is a day old.
+
+The two are refused together: yt-dlp would dump the browser's entire cookie jar
+into the file.
+
+The manifest records **whether** a video was fetched signed in —
+`run_settings.cookies` is `"browser"`, `"file"` or `null` — and nothing more.
+
+### `--proxy URL`
+
+```bash
+ytdl "https://youtu.be/VIDEOID" --proxy socks5h://127.0.0.1:1080
+```
+
+`http`, `https`, `socks4`, `socks4a`, `socks5` or `socks5h` (the `h` resolves
+DNS at the proxy). `user:password@` is accepted and is masked as `***@` in every
+log line this pipeline writes. The proxy reaches `postprocess.ps1` through the
+environment, not its command line, because yt-dlp prints that command line into
+the session log. It is **not** hidden from the process list — see
+`SECURITY.md`. The PO token provider does not go through it.
+
+### `--limit-rate RATE`
+
+Bytes per second with an optional `K`, `M` or `G`: `500K`, `2M`, `1.5M`.
+**Per yt-dlp process**, so with `--workers 3` the session can use up to three
+times the figure; the launcher says so when both are given.
+
+### `--downloader native|aria2c`
+
+`aria2c` must be on `PATH`; the launcher checks before anything starts. yt-dlp
+prints no `[download] NN%` lines through an external downloader, so anything
+that reads progress from them shows none — the session log says so.
+
+### What `--probe` does with these
+
+Accepts the cookie options and `--proxy`, because they change what yt-dlp can
+see — a members-only video, a geo-blocked one, the Premium formats — and a
+preview taken without them describes a different video from the one the
+download gets. Refuses the rest of this section and all of the previous one.
+
 ## Filling in a video you already have
 
 ### `--refresh`
@@ -436,8 +566,14 @@ Passes an argument straight to yt-dlp, after the config file so it wins.
 Repeatable, one value per occurrence:
 
 ```bash
-ytdl "https://youtu.be/VIDEOID" --ytdlp-arg --sponsorblock-mark --ytdlp-arg all
+ytdl "https://youtu.be/VIDEOID" --ytdlp-arg --match-filter --ytdlp-arg "!is_live"
 ```
+
+Cookies, proxy, SponsorBlock, speed limit and subtitle languages used to be the
+common reasons to reach for this. Each now has an option of its own, validated
+here and — for the connection options — carried to every yt-dlp process the
+session starts rather than only the download. The passthrough still works for
+them and still wins, since it comes last.
 
 One value per occurrence rather than a joined string because a real
 `--match-filter` expression contains spaces, commas and `&`, so no separator
@@ -528,6 +664,15 @@ something other than what was asked:
 --refresh --sync                          --sync stops at exactly the videos
                                           --refresh is for
 --refresh --probe                         a probe downloads nothing
+--sub-langs de --no-subs                  chooses subtitles, then fetches none
+--sponsorblock-mark all --no-chapters     marks as chapters, then embeds none
+--cookies F --cookies-from-browser B      would save the browser's whole jar
+                                          into F
+--mode comments-only --fps 30             (and --no-chapters, --sponsorblock-*)
+                                          the mode downloads no media
+--downloader aria2c                       when aria2c is not on PATH
+--probe --limit-rate 1M                   (and --downloader, and every media
+                                          option) a probe moves no media
 ```
 
 ## Combining flags

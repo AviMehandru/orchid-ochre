@@ -154,8 +154,21 @@ actually in force. `run_settings` carries the difference:
 | `mode` | the `--mode` value |
 | `quality`, `codec`, `audio_codec`, `container` | the content options as resolved |
 | `no_comments`, `no_subs`, `no_thumbnail`, `no_metadata` | component skips |
+| `fps` | the `--fps` ceiling, or `null` |
+| `sub_langs` | the `--sub-langs` list, or `null` for the conf's `en.*` |
+| `no_chapters` | `--no-chapters` |
+| `sponsorblock_mark` | the `--sponsorblock-mark` categories, or `null` |
+| `sponsorblock_remove` | the `--sponsorblock-remove` categories, or `null`. **Non-null means the media file was re-cut** and is not the file YouTube served; check this before comparing a duration or a checksum against an outside copy |
+| `cookies` | `"browser"`, `"file"` or `null` — whether the video was fetched signed in. Never the path, profile or cookies |
 | `passthrough` | raw `--ytdlp-arg` values, in order |
 | `effective_args` | the complete argument list appended after the conf |
+
+The six keys after the skips were added with those options, without a layout bump — added
+fields are backward-compatible under this contract — so a manifest written
+before them simply lacks them, and a reader must treat an absent key as its
+default. The **connection** options (`--proxy`, `--limit-rate`, `--downloader`,
+the cookie source) are deliberately absent from `effective_args`: they do not
+describe the content, and a manifest travels with the archive.
 
 Read `config_file_version` **and** `run_settings` together. Either alone is a
 partial answer. `run_settings` may be `null` for a video written by a

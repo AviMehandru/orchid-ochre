@@ -97,6 +97,44 @@
       --container EXT   Merge container for video: mkv (default), mp4,
                         webm. mkv is the archival choice; mp4 is the
                         compatible one. Ignored when no merge happens.
+      --fps N           Frame-rate ceiling, e.g. --fps 30. The same shape
+                        as --quality: a cap with a fallback, not a filter
+                        that can fail. Be aware of what YouTube actually
+                        publishes -- a 60 fps upload is usually offered at
+                        60 fps from 720p up and 30 fps only below that, so
+                        --fps 30 on such a video can mean 480p. That is
+                        what "no more than 30 fps" means; it is not a bug.
+      --sub-langs LIST  Which subtitle languages to fetch, replacing the
+                        conf's "en.*". yt-dlp's own syntax: comma-separated
+                        language codes or regexes, "all", and a leading "-"
+                        to exclude, e.g. --sub-langs "en.*,de,-live_chat".
+                        Works with --mode subs-only and with --refresh, so
+                        a video archived with English subtitles can have
+                        German added later without touching its media.
+      --no-chapters     Do not embed chapter markers into the media file.
+                        The chapters are still in the info.json.
+      --sponsorblock-mark CATS
+                        Add SponsorBlock segments as CHAPTERS -- nothing is
+                        cut. CATS is a comma-separated list from: sponsor,
+                        intro, outro, selfpromo, preview, filler,
+                        interaction, music_offtopic, hook, poi_highlight,
+                        chapter, all, default; a leading "-" excludes one,
+                        e.g. --sponsorblock-mark all,-filler.
+      --sponsorblock-remove CATS
+                        CUT those segments out of the merged file. The same
+                        category list, less poi_highlight and chapter (they
+                        are points, not spans). Read this before using it
+                        on an archive: the file in "Final files" is then no
+                        longer the file YouTube served. --keep-video means
+                        the uncut streams survive in "Pre-merge streams",
+                        and the manifest's run_settings records the cut,
+                        so it is never silent -- but it is a deliberate
+                        departure from "keep the original bytes".
+
+      --fps, --no-chapters and the two --sponsorblock options describe the
+      media file, so each is refused with a mode that downloads none.
+      --sub-langs is accepted with every mode (subtitles are written in all
+      of them unless --no-subs says otherwise) and refused with --no-subs.
 
     Leaving a COMPONENT out (each is independent of --mode):
 
@@ -149,6 +187,50 @@
                         already-archived video and would therefore stop at
                         every video --refresh exists to reach.
 
+    HOW the pipeline reaches YouTube (none of these change what is kept):
+
+      --cookies-from-browser SPEC
+                        Read cookies from a browser profile, in yt-dlp's
+                        own syntax: BROWSER[+KEYRING][:PROFILE][::CONTAINER].
+                        BROWSER is one of brave, chrome, chromium, edge,
+                        firefox, opera, safari, vivaldi, whale; KEYRING one
+                        of basictext, gnomekeyring, kwallet, kwallet5,
+                        kwallet6. For members-only, age-restricted and
+                        private videos, and for the Premium bitrate tier.
+      --cookies FILE    Read cookies from a Netscape-format cookies.txt.
+                        The file is never written to: yt-dlp saves its
+                        cookie jar back to that path on exit, so every
+                        yt-dlp process this pipeline starts is handed its
+                        own private copy instead -- otherwise --workers N
+                        would be N processes rewriting one file at once.
+                        Cannot be combined with --cookies-from-browser
+                        (yt-dlp would dump the browser's whole jar into
+                        the file).
+      --proxy URL       http://, https://, socks4://, socks4a://, socks5://
+                        or socks5h:// (the h resolves DNS at the proxy).
+                        user:password@ is accepted and is masked in every
+                        log line this pipeline writes. It is NOT hidden
+                        from the process list; see SECURITY.md.
+      --limit-rate RATE Download speed ceiling in bytes per second, with
+                        an optional K, M or G suffix: --limit-rate 2M.
+                        PER yt-dlp PROCESS -- with --workers 3 the total is
+                        up to three times this.
+      --downloader NAME native (the default) or aria2c. aria2c must be on
+                        PATH. Note that yt-dlp prints no "[download] NN%"
+                        lines through an external downloader, so anything
+                        that reads progress from them -- including every
+                        app built on this command -- shows none.
+
+      These reach every yt-dlp process a session starts: the download
+      itself, the --workers enumeration pass, and postprocess.ps1's
+      comments and Channel Info passes (--limit-rate and --downloader only
+      the download). --probe accepts the cookie options and --proxy, since
+      both change what yt-dlp can see; it refuses the other two. The
+      manifest records WHETHER cookies were used (run_settings.cookies:
+      "browser", "file" or null) and nothing else from this section --
+      a cookie path or a proxy password has no business in an archive
+      that may be copied somewhere else.
+
     Asking instead of downloading:
 
       --probe           Do not download anything. Print ONE JSON document
@@ -184,7 +266,7 @@
 
       --ytdlp-arg ARG   Pass ARG straight to yt-dlp, after the config file
                         so it wins. Repeatable:
-                            --ytdlp-arg --sponsorblock-mark --ytdlp-arg all
+                            --ytdlp-arg --match-filter --ytdlp-arg "!is_live"
                         Options that would break the archive layout (-o,
                         --paths, --exec, --config-location, --ignore-config,
                         --download-archive) are refused here rather than
@@ -262,8 +344,12 @@ Usage: ytdl <youtube-url> [download-root-path] [options]
   Content:   [--mode full|video-only|audio-only|metadata-only|comments-only|subs-only]
              [--quality N|best] [--codec any|avc1|vp9|av01]
              [--audio-codec any|opus|aac|mp3|flac] [--container mkv|mp4|webm]
+             [--fps N] [--sub-langs LIST] [--no-chapters]
+             [--sponsorblock-mark CATS] [--sponsorblock-remove CATS]
   Skips:     [--no-comments] [--no-subs] [--no-thumbnail] [--no-metadata]
              [--no-audio] [--no-video]
+  Network:   [--cookies-from-browser SPEC | --cookies FILE] [--proxy URL]
+             [--limit-rate RATE] [--downloader native|aria2c]
   Re-fetch:  [--refresh]         (with --mode metadata-only|comments-only|subs-only)
   Escape:    [--ytdlp-arg ARG]   (repeatable)
   Ask only:  [--probe]           (prints JSON, downloads nothing)
@@ -284,7 +370,9 @@ if ($argList.Count -eq 0 -or [string]::IsNullOrWhiteSpace($argList[0])) {
 $knownOptions = @("--sync", "--items", "--after", "--lazy", "--workers", "--path", "--no-pot", "--skip-pot-update", "--pot-port",
                   "--mode", "--quality", "--codec", "--audio-codec", "--container",
                   "--no-comments", "--no-subs", "--no-thumbnail", "--no-metadata", "--no-audio", "--no-video",
-                  "--refresh", "--ytdlp-arg", "--probe")
+                  "--refresh", "--ytdlp-arg", "--probe",
+                  "--fps", "--sub-langs", "--no-chapters", "--sponsorblock-mark", "--sponsorblock-remove",
+                  "--cookies-from-browser", "--cookies", "--proxy", "--limit-rate", "--downloader")
 
 # The accepted values for the four enumerated content options. Validated
 # HERE, at the point the user typed them, rather than left to
@@ -297,6 +385,58 @@ $validModes        = @("full", "video-only", "audio-only", "metadata-only", "com
 $validCodecs       = @("any", "avc1", "vp9", "av01")
 $validAudioCodecs  = @("any", "opus", "aac", "mp3", "flac")
 $validContainers   = @("mkv", "mp4", "webm")
+
+# The external-downloader choice. Only two, on purpose: yt-dlp also knows
+# curl, wget, axel and httpie, and none of them does anything for a
+# YouTube DASH download that the native downloader does not already do
+# better (fragment retries, the --concurrent-fragments setting in the
+# conf). aria2c is on the list because it is the one people ask for by
+# name. 020-launcher asserts this agrees with run_ytdlp.ps1's [ValidateSet].
+$validDownloaders  = @("native", "aria2c")
+
+# The next three lists are yt-dlp's, copied from its --help as of the
+# 2026.08 releases, and they are the only lists in this file that belong
+# to someone else. They are checked here anyway, for the same reason
+# --codec is: yt-dlp's own error for "--cookies-from-browser firefx" is a
+# Python traceback ending in "unsupported browser", arriving after the PO
+# token provider has been brought up and the session log opened, and a
+# GUI shows that as a failed download rather than a typo. If yt-dlp adds a
+# browser, this list is the one line to change -- and until it is,
+# --ytdlp-arg --cookies-from-browser still reaches yt-dlp unchecked.
+$validBrowsers     = @("brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale")
+$validKeyrings     = @("basictext", "gnomekeyring", "kwallet", "kwallet5", "kwallet6")
+$validSponsorCats  = @("sponsor", "intro", "outro", "selfpromo", "preview", "filler",
+                       "interaction", "music_offtopic", "hook", "poi_highlight", "chapter",
+                       "all", "default")
+# Points in time rather than spans, so there is nothing to cut. yt-dlp
+# rejects them in --sponsorblock-remove; refusing them here says why.
+$sponsorPointCats  = @("poi_highlight", "chapter")
+
+$validProxySchemes = @("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+
+# user:password@ in a proxy URL is replaced with ***@ wherever this script
+# echoes the URL back -- which is only ever in an error message, but an
+# error message is exactly what somebody pastes into an issue. The same
+# function exists in run_ytdlp.ps1 for the session log; 020-launcher and
+# 040-run-ytdlp each assert their copy.
+function Hide-ProxyCredentials {
+    param([string]$ProxyUrl)
+    return ($ProxyUrl -replace '(?<=://)[^/@]*@', '***@')
+}
+
+# A SponsorBlock category list: comma-separated, each optionally prefixed
+# with "-" to exclude it. Returns the offending token, or $null when the
+# whole list is acceptable. Empty tokens ("sponsor,,intro") are refused
+# rather than skipped, since they almost always mean a paste went wrong.
+function Find-BadSponsorCategory {
+    param([string]$List, [string[]]$Allowed)
+    foreach ($token in ($List -split ',')) {
+        $bare = $token.Trim()
+        if ($bare.StartsWith("-")) { $bare = $bare.Substring(1) }
+        if (-not $bare -or $Allowed -notcontains $bare) { return $token }
+    }
+    return $null
+}
 
 # The modes that download no media at all. Kept as a named list rather
 # than an inline three-way -or because run_ytdlp.ps1 and postprocess.ps1
@@ -404,6 +544,17 @@ $noVideo         = $false
 $refresh         = $false
 $ytdlpArgs       = @()
 $probe           = $false
+
+$fps                = ""
+$subLangs           = ""
+$noChapters         = $false
+$sponsorMark        = ""
+$sponsorRemove      = ""
+$cookiesFromBrowser = ""
+$cookiesFile        = ""
+$proxy              = ""
+$limitRate          = ""
+$downloader         = ""
 
 # Backward compatibility with the old positional form: if the first
 # remaining argument does not start with "--", treat it as the legacy
@@ -529,6 +680,142 @@ while ($i -lt $rest.Count) {
             }
             $i += 2
         }
+        "--fps" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --fps requires a frame rate (e.g. --fps 30)"; exit 1 }
+            $fps = $rest[$i + 1]
+            # Whole numbers only. yt-dlp's fps field is a float (29.97 is
+            # stored as 30 by YouTube's own metadata, but other extractors
+            # report 29.97), and "<=30" already admits 29.97 -- so there is
+            # nothing a fractional ceiling can express that the next whole
+            # number up does not.
+            if ($fps -notmatch '^\d+$' -or [int]$fps -lt 1 -or [int]$fps -gt 1000) {
+                Write-Usage "Error: --fps requires a whole number of frames per second between 1 and 1000 (got: '$fps')"
+                exit 1
+            }
+            $i += 2
+        }
+        "--sub-langs" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --sub-langs requires a value (e.g. --sub-langs `"en.*,de`")"; exit 1 }
+            $subLangs = $rest[$i + 1]
+            # yt-dlp treats each entry as a regex, so the check is only for
+            # shapes that cannot be what anybody meant: an empty entry, or
+            # whitespace inside one (a list typed as "en, de" would ask for
+            # a language literally named " de"). Anything else -- "en.*",
+            # "pt-BR", "-live_chat", "all" -- is yt-dlp's to interpret.
+            $badLang = @($subLangs -split ',' | Where-Object { -not $_ -or $_ -match '\s' })
+            if (-not $subLangs -or $badLang.Count -gt 0) {
+                Write-Usage "Error: --sub-langs takes a comma-separated list with no spaces and no empty entries, e.g. --sub-langs `"en.*,de,-live_chat`" (got: '$subLangs')"
+                exit 1
+            }
+            $i += 2
+        }
+        "--no-chapters" { $noChapters = $true; $i++ }
+        "--sponsorblock-mark" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --sponsorblock-mark requires a category list (e.g. --sponsorblock-mark all)"; exit 1 }
+            $sponsorMark = $rest[$i + 1]
+            $bad = Find-BadSponsorCategory -List $sponsorMark -Allowed $validSponsorCats
+            if ($null -ne $bad) {
+                Write-Usage "Error: --sponsorblock-mark: '$bad' is not a SponsorBlock category. Use a comma-separated list from: $($validSponsorCats -join ', ') -- prefix one with '-' to exclude it."
+                exit 1
+            }
+            $i += 2
+        }
+        "--sponsorblock-remove" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --sponsorblock-remove requires a category list (e.g. --sponsorblock-remove sponsor)"; exit 1 }
+            $sponsorRemove = $rest[$i + 1]
+            $cuttable = @($validSponsorCats | Where-Object { $sponsorPointCats -notcontains $_ })
+            $bad = Find-BadSponsorCategory -List $sponsorRemove -Allowed $cuttable
+            if ($null -ne $bad) {
+                $why = if ($sponsorPointCats -contains $bad.Trim().TrimStart('-')) {
+                    "'$bad' marks a point in the video, not a span, so there is nothing to cut -- use it with --sponsorblock-mark instead."
+                } else {
+                    "'$bad' is not a SponsorBlock category. Use a comma-separated list from: $($cuttable -join ', ')."
+                }
+                Write-Usage "Error: --sponsorblock-remove: $why"
+                exit 1
+            }
+            $i += 2
+        }
+
+        # --- How YouTube is reached ---
+        "--cookies-from-browser" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --cookies-from-browser requires a browser (e.g. --cookies-from-browser firefox)"; exit 1 }
+            $cookiesFromBrowser = $rest[$i + 1]
+            # BROWSER[+KEYRING][:PROFILE][::CONTAINER]. Only the two parts
+            # with a closed vocabulary are checked. PROFILE is a name or a
+            # path and CONTAINER is a Firefox container name; both are
+            # free-form, and yt-dlp's own "could not find profile" names
+            # the thing it could not find.
+            if ($cookiesFromBrowser -notmatch '^(?<browser>[^+:]+)(\+(?<keyring>[^:]+))?(:.*)?$') {
+                Write-Usage "Error: --cookies-from-browser takes BROWSER[+KEYRING][:PROFILE][::CONTAINER] (got: '$cookiesFromBrowser')"
+                exit 1
+            }
+            $browserName = $Matches['browser'].ToLowerInvariant()
+            $keyringName = $Matches['keyring']
+            if ($validBrowsers -notcontains $browserName) {
+                Write-Usage "Error: --cookies-from-browser: '$($Matches['browser'])' is not a browser yt-dlp can read. Use one of: $($validBrowsers -join ', ')"
+                exit 1
+            }
+            if ($keyringName -and $validKeyrings -notcontains $keyringName.ToLowerInvariant()) {
+                Write-Usage "Error: --cookies-from-browser: '$keyringName' is not a keyring yt-dlp knows. Use one of: $($validKeyrings -join ', ')"
+                exit 1
+            }
+            $i += 2
+        }
+        "--cookies" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --cookies requires the path to a cookies.txt file"; exit 1 }
+            $cookiesFile = $rest[$i + 1]
+            # Checked now and resolved to an absolute path now, because the
+            # file is next opened by a different process (run_ytdlp.ps1,
+            # then postprocess.ps1 from inside yt-dlp's --exec) whose
+            # working directory is nobody's business but its own.
+            if (-not (Test-Path -LiteralPath $cookiesFile -PathType Leaf)) {
+                Write-Usage "Error: --cookies: no such file: '$cookiesFile'"
+                exit 1
+            }
+            $cookiesFile = (Resolve-Path -LiteralPath $cookiesFile).ProviderPath
+            $i += 2
+        }
+        "--proxy" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --proxy requires a URL (e.g. --proxy socks5://127.0.0.1:1080)"; exit 1 }
+            $proxy = $rest[$i + 1]
+            # Scheme and a non-empty host[:port] -- nothing else. A proxy
+            # URL with a path is always a paste of something else, and a
+            # bare "host:port" with no scheme is the commonest mistake:
+            # yt-dlp would read it as scheme "host", fail on the first
+            # request, and report it as a network error.
+            $schemes = ($validProxySchemes | ForEach-Object { [regex]::Escape($_) }) -join '|'
+            # The host is a name, an IPv4 address or a bracketed IPv6
+            # literal ([::1]) -- the brackets are the only way a colon can
+            # appear in it.
+            if ($proxy -notmatch "^($schemes)://([^/@\s]*@)?(\[[0-9A-Fa-f:.]+\]|[^/@\s:\[\]]+)(:\d{1,5})?/?$") {
+                Write-Usage "Error: --proxy takes SCHEME://[user:password@]host[:port] with a scheme of $($validProxySchemes -join ', ') (got: '$(Hide-ProxyCredentials $proxy)')"
+                exit 1
+            }
+            $i += 2
+        }
+        "--limit-rate" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --limit-rate requires a rate (e.g. --limit-rate 2M)"; exit 1 }
+            $limitRate = $rest[$i + 1]
+            # Bytes per second, K/M/G suffix, decimal allowed: 500K, 2M,
+            # 1.5M. Upper or lower case, as yt-dlp accepts both. Zero is
+            # refused -- yt-dlp would take it as "no limit", which is the
+            # opposite of what someone typing a limit wanted.
+            if ($limitRate -notmatch '^(?i)\d+(\.\d+)?[kmg]?$' -or [double]($limitRate -replace '(?i)[kmg]$', '') -le 0) {
+                Write-Usage "Error: --limit-rate takes bytes per second with an optional K, M or G suffix, e.g. 500K or 2M (got: '$limitRate')"
+                exit 1
+            }
+            $i += 2
+        }
+        "--downloader" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --downloader requires a value ($($validDownloaders -join ', '))"; exit 1 }
+            $downloader = $rest[$i + 1]
+            if ($validDownloaders -notcontains $downloader) {
+                Write-Usage "Error: --downloader must be one of: $($validDownloaders -join ', ') (got: '$downloader')"
+                exit 1
+            }
+            $i += 2
+        }
 
         # --- Component skips ---
         "--no-comments"  { $noComments  = $true; $i++ }
@@ -550,7 +837,7 @@ while ($i -lt $rest.Count) {
         # passes them -- is that the argument is not one of the handful
         # that would redirect the output somewhere no reader can find it.
         "--ytdlp-arg" {
-            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --ytdlp-arg requires a value (e.g. --ytdlp-arg --sponsorblock-mark --ytdlp-arg all)"; exit 1 }
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --ytdlp-arg requires a value (e.g. --ytdlp-arg --match-filter --ytdlp-arg `"!is_live`")"; exit 1 }
             $ytdlpArgs += $rest[$i + 1]
             $i += 2
         }
@@ -604,6 +891,15 @@ if ($noMediaModes -contains $mode) {
     if ($codec -and $codec -ne "any")      { $mediaOnlyOpts += "--codec" }
     if ($audioCodec -and $audioCodec -ne "any") { $mediaOnlyOpts += "--audio-codec" }
     if ($container)                        { $mediaOnlyOpts += "--container" }
+    if ($fps)                              { $mediaOnlyOpts += "--fps" }
+    if ($noChapters)                       { $mediaOnlyOpts += "--no-chapters" }
+    if ($sponsorMark)                      { $mediaOnlyOpts += "--sponsorblock-mark" }
+    if ($sponsorRemove)                    { $mediaOnlyOpts += "--sponsorblock-remove" }
+    # --limit-rate and --downloader are deliberately NOT here. They are
+    # about the connection rather than the media, and a no-media mode still
+    # downloads subtitles and thumbnails through the same downloader; a
+    # frontend that stores a speed limit as a setting applies it to every
+    # run it starts, re-fetches included, and must not be refused for it.
     if ($mediaOnlyOpts.Count -gt 0) {
         Write-Usage "Error: --mode $mode downloads no media, so $($mediaOnlyOpts -join ' and ') cannot apply. Drop the option, or pick a mode that downloads media."
         exit 1
@@ -647,6 +943,41 @@ if ($refresh) {
         Write-Usage "Error: --refresh and --sync contradict each other. --sync stops at the first video already in archive.txt, and every video --refresh can reach is already in archive.txt."
         exit 1
     }
+}
+
+# --- The contradictions among the newer options ---
+# Same rule as above: each is a combination that would run to the end and
+# produce something other than what was asked for.
+if ($subLangs -and $noSubs) {
+    Write-Usage "Error: --sub-langs chooses which subtitles to fetch, and --no-subs fetches none. Drop one."
+    exit 1
+}
+# SponsorBlock marking works by writing chapters into the file. With
+# chapter embedding switched off the segments are fetched, turned into
+# chapters, and then not embedded: a run that talks to one more server
+# and changes nothing.
+if ($sponsorMark -and $noChapters) {
+    Write-Usage "Error: --sponsorblock-mark adds its segments as chapters, and --no-chapters embeds none. Drop one."
+    exit 1
+}
+# yt-dlp would load the browser's cookies into its jar and then save that
+# whole jar to the --cookies path on exit -- every cookie in the browser
+# profile, for every site, written to a plain-text file. This pipeline
+# hands yt-dlp a copy rather than the real path (see --cookies above),
+# but the combination has no legitimate use to weigh against that.
+if ($cookiesFromBrowser -and $cookiesFile) {
+    Write-Usage "Error: --cookies-from-browser and --cookies are two sources for the same thing. Pick one."
+    exit 1
+}
+# Refused now rather than left to yt-dlp, whose answer to a missing
+# external downloader arrives per video, after extraction, as an error the
+# session summary counts once per video in the playlist.
+if ($downloader -eq "aria2c" -and -not (Get-Command aria2c -ErrorAction SilentlyContinue)) {
+    Write-Usage "Error: --downloader aria2c: aria2c is not on PATH. Install it (apt install aria2 / brew install aria2 / winget install aria2.aria2) or drop the option."
+    exit 1
+}
+if ($limitRate -and $workers -and [int]$workers -gt 1) {
+    Write-Usage "Note: --limit-rate applies to each of the $workers workers separately, so the session as a whole can use up to $workers times $limitRate."
 }
 
 # --audio-codec only reaches yt-dlp in audio-only mode (it drives the
@@ -698,6 +1029,19 @@ if ($probe) {
     # refusal list is the contract, and an option missing from it is the
     # kind of gap that survives a later change to the checks above.
     if ($refresh)         { $downloadOnlyOpts += "--refresh" }
+    if ($fps)             { $downloadOnlyOpts += "--fps" }
+    if ($subLangs)        { $downloadOnlyOpts += "--sub-langs" }
+    if ($noChapters)      { $downloadOnlyOpts += "--no-chapters" }
+    if ($sponsorMark)     { $downloadOnlyOpts += "--sponsorblock-mark" }
+    if ($sponsorRemove)   { $downloadOnlyOpts += "--sponsorblock-remove" }
+    # The two transfer options describe how bytes are FETCHED, and a probe
+    # fetches none. The cookie options and --proxy are not in this list:
+    # they change what yt-dlp can SEE -- a members-only video, a
+    # geo-blocked one, the Premium bitrate formats -- and a preview taken
+    # without them would describe a different video from the one the
+    # download gets.
+    if ($limitRate)       { $downloadOnlyOpts += "--limit-rate" }
+    if ($downloader)      { $downloadOnlyOpts += "--downloader" }
     if ($downloadOnlyOpts.Count -gt 0) {
         Write-Usage "Error: --probe downloads nothing, so $($downloadOnlyOpts -join ', ') cannot apply. Probe the URL first, then run it with the options you want."
         exit 1
@@ -711,6 +1055,9 @@ if ($probe) {
     if ($playlistItems) { $probeArgs += @("-PlaylistItems", $playlistItems) }
     if ($noPot)         { $probeArgs += "-NoPot" }
     if ($potPort)       { $probeArgs += @("-PotPort", $potPort) }
+    if ($cookiesFromBrowser) { $probeArgs += @("-CookiesFromBrowser", $cookiesFromBrowser) }
+    if ($cookiesFile)        { $probeArgs += @("-CookiesFile", $cookiesFile) }
+    if ($proxy)              { $probeArgs += @("-Proxy", $proxy) }
     if ($ytdlpArgs.Count -gt 0) {
         $probeJson = ConvertTo-Json -Compress -InputObject @($ytdlpArgs)
         $probeArgs += @("-YtdlpArgsB64",
@@ -744,6 +1091,18 @@ if ($noSubs)         { $pwshArgs += "-NoSubs" }
 if ($noThumbnail)    { $pwshArgs += "-NoThumbnail" }
 if ($noMetadata)     { $pwshArgs += "-NoMetadata" }
 if ($refresh)        { $pwshArgs += "-Refresh" }
+
+if ($fps)            { $pwshArgs += @("-Fps", $fps) }
+if ($subLangs)       { $pwshArgs += @("-SubLangs", $subLangs) }
+if ($noChapters)     { $pwshArgs += "-NoChapters" }
+if ($sponsorMark)    { $pwshArgs += @("-SponsorblockMark", $sponsorMark) }
+if ($sponsorRemove)  { $pwshArgs += @("-SponsorblockRemove", $sponsorRemove) }
+
+if ($cookiesFromBrowser) { $pwshArgs += @("-CookiesFromBrowser", $cookiesFromBrowser) }
+if ($cookiesFile)        { $pwshArgs += @("-CookiesFile", $cookiesFile) }
+if ($proxy)              { $pwshArgs += @("-Proxy", $proxy) }
+if ($limitRate)          { $pwshArgs += @("-LimitRate", $limitRate) }
+if ($downloader)         { $pwshArgs += @("-Downloader", $downloader) }
 
 # --- Passing an ARRAY across `pwsh -File`, which cannot be done directly ---
 # This is the same boundary problem setup-common.ps1 documents for
