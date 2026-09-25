@@ -58,6 +58,7 @@ Three side effects are worth naming because they are real:
 | `060-locking` | Six real concurrent `postprocess.ps1` processes across two channels, checking that no manifest update is lost. |
 | `070-installer` | Step-count agreement across all three halves, `$ProjectFiles` ↔ `Install-ProjectFile` coverage, the keep-going error handling, no `curl \| sh`, plus a real dry run of the shared half from a local checkout. |
 | `080-viewer` | `archive-viewer.py` started for real and driven over HTTP: routes, metadata, comments, the read-only invariant (before/after inventory of the whole archive), and nine path-traversal probes. |
+| `087-subscriptions` | `ytdl --subscribe` and the subscription commands against a stub yt-dlp: what is stored (parsed, not typed; paths absolute; proxy passwords masked in every listing, `chmod 600` on disk), the JSON contract, the due rule and its slack, deferral while another session holds `.session.lock`, refusal of a second runner, `ok`/`errors`/`failed`, and a separate session log. The systemd units, launchd plist and Task Scheduler XML are generated on any platform and parsed (`systemd-analyze verify` when present); the systemd install/remove path runs against a stubbed `systemctl`. |
 | `090-live` | Opt-in. One real video, real yt-dlp, real ffmpeg, real network. Skipped unless `-Live`. |
 
 ## Options

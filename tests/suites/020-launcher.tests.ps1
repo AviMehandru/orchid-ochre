@@ -63,7 +63,8 @@ param(
     [Parameter(Mandatory = $false)][string]$Proxy = "",
     [Parameter(Mandatory = $false)][ValidatePattern('^$|^(?i)\d+(\.\d+)?[kmg]?$')][string]$LimitRate = "",
     [Parameter(Mandatory = $false)][ValidateSet("native", "aria2c")][string]$Downloader = "",
-    [Parameter(Mandatory = $false)][string]$YtdlpArgsB64 = ""
+    [Parameter(Mandatory = $false)][string]$YtdlpArgsB64 = "",
+    [Parameter(Mandatory = $false)][ValidatePattern('^download(\.[A-Za-z0-9_-]+)?\.log$')][string]$SessionLog = "download.log"
 )
 # The passthrough array is decoded here rather than captured raw, so the
 # assertion in the test reads the arguments the way run_ytdlp.ps1 will
@@ -105,6 +106,7 @@ if ($YtdlpArgsB64) {
     Proxy           = $Proxy
     LimitRate       = $LimitRate
     Downloader      = $Downloader
+    SessionLog      = $SessionLog
     Passthrough     = $decodedPassthrough
 } | ConvertTo-Json | Set-Content -LiteralPath $env:YTDL_TEST_CAPTURE
 '@
@@ -649,6 +651,87 @@ if ($YtdlpArgsB64) {
         Assert-True ($runner -match '\[ValidateSet\(([^)]*)\)\]\[string\]\$Downloader') 'run_ytdlp.ps1 must validate -Downloader'
         $b = @([regex]::Matches($Matches[1], '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
         Assert-Equal ($a -join ',') ($b -join ',')
+    }
+
+    It 'carries every download option into a subscription, or excludes it on purpose' {
+        # Get-SubscriptionOptions rebuilds a stored command line from the
+        # parsed values, so it is a THIRD list of the options beside
+        # $knownOptions and the switch. An option missing from it is
+        # accepted by --subscribe and then silently dropped from every
+        # check -- a subscription that downloads at the wrong quality
+        # forever with nothing anywhere saying so.
+        $src = Get-Content -LiteralPath (Join-Path $root.InstallRoot 'scripts/ytdl.ps1') -Raw
+        Assert-True ($src -match '(?sm)^\$knownOptions\s*=\s*@\((.*?)\)\s*$') '$knownOptions could not be read'
+        $known = @([regex]::Matches($Matches[1], '"(--[a-z-]+)"') | ForEach-Object { $_.Groups[1].Value })
+        Assert-True ($src -match '(?s)function Get-SubscriptionOptions \{(.*?)\n\}') 'Get-SubscriptionOptions could not be read'
+        $body = $Matches[1]
+        # Excluded, each for a reason: --path is stored as data_root;
+        # --no-audio/--no-video are stored as the --mode they resolve to;
+        # --refresh and --probe are refused with --subscribe; the last four
+        # describe the subscription itself.
+        $excluded = @('--path', '--no-audio', '--no-video', '--refresh', '--probe',
+                      '--subscribe', '--every', '--name', '--paused')
+        foreach ($opt in $known) {
+            if ($excluded -contains $opt) { continue }
+            Assert-True ($body -match ('"' + [regex]::Escape($opt) + '"')) "$opt is accepted by --subscribe but never stored"
+        }
+    }
+
+    It 'runs a subscription with exactly the parameters the typed command would have' {
+        # The round trip: store a command line, run it through the
+        # subscription runner, and compare what reached run_ytdlp.ps1 with
+        # what the same command typed directly produces. Any difference is
+        # a subscription that quietly downloads something other than what
+        # was asked for.
+        $cookieFile = Join-Path $root.Root 'rt-cookies.txt'
+        Set-Content -LiteralPath $cookieFile -Value '# Netscape HTTP Cookie File'
+        $opts = @('--sync', '--items', '1-50', '--after', '20250101', '--workers', '2', '--no-pot',
+                  '--mode', 'full', '--quality', '1080', '--codec', 'vp9', '--container', 'mp4', '--fps', '30',
+                  '--sub-langs', 'en.*,de', '--sponsorblock-mark', 'all,-filler', '--no-comments', '--no-thumbnail',
+                  '--cookies', $cookieFile, '--proxy', 'socks5://u:p@127.0.0.1:1080', '--limit-rate', '2M',
+                  '--ytdlp-arg', '--match-filter', '--ytdlp-arg', '!is_live & duration > 60')
+        $channelUrl = 'https://www.youtube.com/@RoundTrip/videos'
+        $dataRoot = Join-Path $root.Root 'rt-data'
+
+        $direct = Invoke-Launcher -Arguments (@($channelUrl, '--path', $dataRoot) + $opts)
+        Assert-Equal 0 $direct.ExitCode ($direct.Output -join "`n")
+
+        $sub = Invoke-Launcher -Arguments (@($channelUrl, '--path', $dataRoot) + $opts + @('--subscribe'))
+        Assert-Equal 0 $sub.ExitCode ($sub.Output -join "`n")
+        Assert-True ($null -eq $sub.Params) '--subscribe must not start a download'
+        $id = [regex]::Match(($sub.Output -join "`n"), 'Subscribed ([0-9a-f]{8})').Groups[1].Value
+        Assert-True ([bool]$id) 'no subscription id was printed'
+
+        $run = Invoke-Launcher -Arguments @('--run-subscriptions', $id)
+        Assert-Equal 0 $run.ExitCode ($run.Output -join "`n")
+        Assert-True ($null -ne $run.Params) 'the runner never reached run_ytdlp.ps1'
+
+        foreach ($p in $direct.Params.PSObject.Properties) {
+            if ($p.Name -eq 'SessionLog') { continue }
+            Assert-Equal (ConvertTo-Json -Compress -InputObject $p.Value) (ConvertTo-Json -Compress -InputObject $run.Params.($p.Name)) `
+                "-$($p.Name) differs between the typed command and the subscription"
+        }
+        Assert-Equal 'download.log' $direct.Params.SessionLog
+        Assert-Equal 'download.subscriptions.log' $run.Params.SessionLog 'a subscription session writes its own log'
+
+        Invoke-Launcher -Arguments @('--unsubscribe', $id) | Out-Null
+    }
+
+    It 'hands YTDL_SESSION_LOG to run_ytdlp.ps1 as -SessionLog, and refuses a path' {
+        $saved = $env:YTDL_SESSION_LOG
+        try {
+            $env:YTDL_SESSION_LOG = 'download.subscriptions.log'
+            $ok = Invoke-Launcher -Arguments @($url)
+            Assert-Equal 'download.subscriptions.log' $ok.Params.SessionLog
+            foreach ($bad in @('../download.log', 'download.log/x', 'other.log', 'download..log')) {
+                $env:YTDL_SESSION_LOG = $bad
+                $r = Invoke-Launcher -Arguments @($url)
+                Assert-Equal 1 $r.ExitCode "YTDL_SESSION_LOG='$bad' must be refused"
+                Assert-True ($null -eq $r.Params) 'and nothing started'
+            }
+        } finally { $env:YTDL_SESSION_LOG = $saved }
+        $plain = Invoke-Launcher -Arguments @($url)
+        Assert-Equal 'download.log' $plain.Params.SessionLog 'unset means the ordinary log'
     }
 
     It 'leaves the content parameters at their defaults when none are given' {

@@ -234,7 +234,16 @@ param(
     # Encoded rather than passed as a [string[]] because `pwsh -File`
     # cannot bind an array at all -- see the long note at the bottom of
     # ytdl.ps1, where both failing spellings are recorded.
-    [Parameter(Mandatory = $false)][string]$YtdlpArgsB64 = ""
+    [Parameter(Mandatory = $false)][string]$YtdlpArgsB64 = "",
+
+    # The session log's file name under Archive Logs/Logs/. download.log
+    # unless a subscription check started this session, in which case it is
+    # download.subscriptions.log -- see subscriptions.ps1's header for why a
+    # scheduled session must not share a log with a manual one. A bare file
+    # name of a fixed shape, never a path: it is joined onto $logsDir and
+    # handed to postprocess.ps1, and a "../" here would put the log, and
+    # every video_complete.log sliced from it, somewhere else entirely.
+    [Parameter(Mandatory = $false)][ValidatePattern('^download(\.[A-Za-z0-9_-]+)?\.log$')][string]$SessionLog = "download.log"
 )
 
 # On PowerShell 7.3+, native-command stderr lines get wrapped as ErrorRecord
@@ -355,7 +364,7 @@ if ([string]::IsNullOrWhiteSpace($DataRoot)) {
 $archiveLogsRoot = Join-Path $dataRoot "Archive Logs"
 $historyDir      = Join-Path $archiveLogsRoot "Archive History"
 $logsDir         = Join-Path $archiveLogsRoot "Logs"
-$logFile         = Join-Path $logsDir "download.log"
+$logFile         = Join-Path $logsDir $SessionLog
 $archiveFile     = Join-Path $logsDir "archive.txt"
 $videosRoot      = Join-Path $dataRoot "Youtube Videos"
 $completeArchiveDir = Join-Path $videosRoot "Complete Archive"
@@ -397,6 +406,45 @@ foreach ($d in $recreatedFolders) {
 }
 
 $timestamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
+
+# --- "A download is running" marker ---
+# Held SHARED for the whole session, and never released by hand: the
+# handle lives until this process exits, which is also what releases it
+# when an app's Cancel kills the process tree. Shared, so any number of
+# sessions -- two terminals, a terminal and an app -- hold it at once
+# exactly as they always could run at once. Its only reader is
+# `ytdl --run-subscriptions`, which tries it EXCLUSIVELY before starting a
+# scheduled check and defers the check while anything holds it; see
+# Test-SessionIdle in subscriptions.ps1 for what that does and does not
+# prevent.
+#
+# In the install root, not the data root: a data root can be on a VMware
+# shared folder or a network mount where flock() is not supported, and
+# .NET quietly skips the lock there rather than failing -- which would
+# make every session invisible to the check. The install root is always a
+# local disk.
+#
+# Opened for READ with FileShare.ReadWrite: on Linux and macOS .NET turns
+# that into flock(LOCK_SH), and for a read-only handle it does so on every
+# filesystem (a writable one skips the lock on NFS and SMB).
+#
+# Best effort by design. The only thing that can hold it exclusively is
+# that one-instant check, so a few retries always get through; and if
+# they somehow do not, the download goes ahead unmarked rather than
+# waiting on a marker.
+$sessionMarker = $null
+$sessionMarkerPath = Join-Path $installRoot ".session.lock"
+for ($attempt = 0; $attempt -lt 40 -and -not $sessionMarker; $attempt++) {
+    try {
+        $sessionMarker = [System.IO.File]::Open($sessionMarkerPath, [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    } catch {
+        Start-Sleep -Milliseconds 50
+    }
+}
+if (-not $sessionMarker) {
+    "NOTE: could not open $sessionMarkerPath; a scheduled subscription check will not know this session is running." | Tee-Object -FilePath $logFile -Append
+}
 
 # --- Dependency updates/checks (throttled to once/day, not every run) ---
 # Tied to $installRoot, not $dataRoot -- this is about the TOOLS themselves
@@ -1318,7 +1366,7 @@ if ($Workers -le 1) {
     # platforms by the time anything can call this script (the launcher
     # that got here was itself started by pwsh), and hardcoding a full path
     # would mean a fourth platform-specific value to keep correct.
-    $execCmd = "after_move:pwsh -NoProfile -File `"$(Join-Path $scriptsRoot 'postprocess.ps1')`" -FilePath %(filepath)q -LogFileName `"download.log`" $ppExtraArgs"
+    $execCmd = "after_move:pwsh -NoProfile -File `"$(Join-Path $scriptsRoot 'postprocess.ps1')`" -FilePath %(filepath)q -LogFileName `"$SessionLog`" $ppExtraArgs"
 
     # Built as an array, not string-interpolated into $execCmd-style text,
     # so an empty/unused option never contributes a stray blank argument to

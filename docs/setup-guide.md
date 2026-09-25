@@ -688,6 +688,7 @@ run has nothing to report.
 | `scripts/run_ytdlp.ps1` | `<root>/scripts/` | shared, unmodified |
 | `scripts/postprocess.ps1` | `<root>/scripts/` | shared, unmodified |
 | `scripts/ytdl.ps1` | `<root>/scripts/` | **the only argument parser**, all platforms |
+| `scripts/subscriptions.ps1` | `<root>/scripts/` | `ytdl --subscribe` and the schedule; see `docs/subscriptions.md`. Installing it does **not** turn the hourly check on — `ytdl --schedule install` does |
 | `scripts/archive-viewer.py` | `<root>/scripts/` | a program, not a command |
 | `config/yt-dlp.conf` | `<root>/configs/` | shared, unmodified |
 | `scripts/ytdl` | `~/.local/bin/ytdl` | Linux and macOS shim |
@@ -714,6 +715,7 @@ such workaround — `"$@"` already expands to one word per original argument.
 cp scripts/run_ytdlp.ps1     "$HOME/yt-dlp/scripts/run_ytdlp.ps1"
 cp scripts/postprocess.ps1   "$HOME/yt-dlp/scripts/postprocess.ps1"
 cp scripts/ytdl.ps1          "$HOME/yt-dlp/scripts/ytdl.ps1"
+cp scripts/subscriptions.ps1 "$HOME/yt-dlp/scripts/subscriptions.ps1"
 cp scripts/archive-viewer.py "$HOME/yt-dlp/scripts/archive-viewer.py"
 cp config/yt-dlp.conf        "$HOME/yt-dlp/configs/yt-dlp.conf"
 cp scripts/ytdl              "$HOME/.local/bin/ytdl"

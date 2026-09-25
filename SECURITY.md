@@ -180,6 +180,34 @@ on exit). Each process gets a private copy in the temp directory, created
 process ends; a copy orphaned by a killed session is swept after a day.
 On Windows the per-user temp directory is already private.
 
+### 7. Subscriptions store connection secrets, and run unattended (scripts/subscriptions.ps1)
+
+`ytdl --subscribe` stores the whole command line, connection options
+included, in `configs/subscriptions.json` under the install root. A
+`--proxy user:password@host` is therefore on disk in plain text, and a
+`--cookies` path names a file of session cookies. The file is written
+through a temporary copy that is `chmod 600` before any content goes in,
+and moved over the old one, so it is never world-readable even for an
+instant; every listing — the terminal one, `--subscriptions --json` and the
+runner's log — masks the password as `***@`. On Windows the install root's
+ACLs apply, and `C:\yt-dlp` inherits the drive root's, which typically let
+other local users read it.
+
+`ytdl --schedule install` registers a job that runs `pwsh` and the installed
+`ytdl.ps1` every hour, as you. Anyone who can write to the install root's
+`scripts/` can therefore get code run as you on that schedule — but they can
+already do that the next time you type `ytdl`, so the schedule changes when,
+not whether. The job carries the `PATH` it was installed with, so a
+directory on that `PATH` writable by someone else is the same exposure it
+already is in your shell.
+
+**Severity**: Low on the single-user VM this runs on. Storing the proxy
+elsewhere (a keyring) was rejected for now: it would need a different
+mechanism on each platform and a way to reach it from a background job with
+no session, for a threat the process list (#6) already exposes during every
+download. Frontends that keep a proxy password as a setting of their own
+send it with `--subscribe`, so this file is the second place it lives.
+
 ## Summary
 
 | # | Issue | File | Severity |
@@ -190,6 +218,7 @@ On Windows the per-user temp directory is already private.
 | 4 | `allow_other` on shared mount | `setup.sh` | Low (single-user VM) |
 | 5 | No `-DataRoot` path validation | `run_ytdlp.ps1` | Informational only |
 | 6 | Proxy password in the process list | `run_ytdlp.ps1`, `probe.ps1` | Low (single-user VM) |
+| 7 | Subscriptions store connection secrets; hourly job | `subscriptions.ps1` | Low (single-user VM) |
 
 ## What implementing these fixes would actually involve
 

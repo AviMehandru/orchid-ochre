@@ -675,6 +675,36 @@ something other than what was asked:
                                           option) a probe moves no media
 ```
 
+## Keeping sources archived: subscriptions
+
+Instead of re-running `ytdl <url> --sync` by hand, store the command line
+and let an hourly check run it:
+
+```bash
+# Validated like a download, stored instead of run
+ytdl "https://youtube.com/@somechannel/videos" --sync --quality 1080 --subscribe --every 12h
+
+# Once per machine: register the hourly check with the operating system
+ytdl --schedule install
+
+ytdl --subscriptions                  # what is subscribed, and when each is next due
+ytdl --run-subscriptions all          # check everything now
+ytdl --edit-subscription ID --pause   # stop checking one for a while
+ytdl --unsubscribe ID                 # stop for good; nothing archived is touched
+```
+
+`--subscribe` takes every download option and `--every Nh|Nd` (default 24h),
+`--name TEXT` and `--paused`. Subscribing the same URL into the same data
+root again replaces its options. The subscription commands take no URL and
+come first on the command line.
+
+The full guide — what is stored, when a subscription is due, what the check
+does while another download is running, the systemd timer, launchd agent and
+Task Scheduler task, and the JSON a frontend reads — is
+[`docs/subscriptions.md`](subscriptions.md).
+
+---
+
 ## Combining flags
 
 Any combination is valid — they're independent and only interact through
@@ -751,9 +781,12 @@ For anyone reading the script directly rather than this doc:
 1. `$1` is always the URL, **including when it starts with `-`** — a
    leading hyphen does not mean "option" in this position, because
    `-QMgcOSyf-o` is a legitimate video id. Missing → usage error, exit.
-2. The single exception to rule 1: if `$1` is exactly one of the known
-   option spellings (`--sync`, `--items`, `--after`, `--lazy`,
-   `--workers`, `--path`), it's a missing-URL error rather than a URL.
+2. The exceptions to rule 1: if `$1` is one of the subscription commands
+   (`--subscriptions`, `--unsubscribe`, `--edit-subscription`,
+   `--run-subscriptions`, `--schedule`), the rest of the line is that
+   command's own arguments and there is no URL. If `$1` is any other known
+   option spelling (`--sync`, `--items`, `--after`, `--lazy`, `--workers`,
+   `--path`, ...), it's a missing-URL error rather than a URL.
 3. If `$1` doesn't look like a URL or a bare 11-character video id, a
    warning about quoting goes to stderr and the run continues.
 4. After the URL, if the *next* remaining argument doesn't start with

@@ -262,6 +262,65 @@
                         that silently dropped --quality would read as
                         though it had honoured it.
 
+    Keeping a source archived without typing this again:
+
+      --subscribe       Do not download now. Store this URL and every other
+                        option on the command line as a SUBSCRIPTION, which
+                        `ytdl --run-subscriptions` -- and the hourly
+                        schedule, once `ytdl --schedule install` has been
+                        run -- downloads from again whenever it is due.
+
+                        The options are validated here exactly as they
+                        would be for a download, and validated AGAIN each
+                        time the subscription runs, by this same parser, so
+                        a subscription can never hold an option a run would
+                        refuse. Subscribing the same URL into the same data
+                        root again REPLACES its options: that is how a
+                        subscription's options are changed.
+
+                        Pair it with --sync for a channel's /videos page,
+                        which is newest first: each check then stops at the
+                        first video it already has. Without --sync every
+                        check walks the whole listing, which is correct but
+                        slow on a large channel.
+
+                        Refused with --probe (which downloads nothing to
+                        repeat) and --refresh (which re-fetches into videos
+                        that are already archived, and would do all of them
+                        again on every check).
+      --every N         How often: Nh or Nd, from 1h to 30d. Default 24h.
+                        Whole hours, because the schedule checks hourly.
+      --name TEXT       A label shown instead of the URL.
+      --paused          Store it without checking it until resumed.
+
+      --every, --name and --paused apply only with --subscribe.
+
+    Managing subscriptions -- these take no URL, and come FIRST:
+
+      ytdl --subscriptions [--json]
+                        List them, with when each was last checked, what
+                        that found, and when it is next due. --json prints
+                        the document described in docs/subscriptions.md,
+                        which is what a frontend reads.
+      ytdl --unsubscribe ID
+                        Stop checking it. Nothing it archived is touched.
+                        ID is the eight-character id from the list, or the
+                        URL when only one subscription has it.
+      ytdl --edit-subscription ID [--every N] [--name TEXT] [--pause|--resume]
+                        Change how often, the label, or pause it. To change
+                        its DOWNLOAD options, --subscribe the URL again.
+      ytdl --run-subscriptions [all | ID ...]
+                        Check now. With no argument: only the ones that are
+                        due, and nothing at all while another download is
+                        running -- this is what the schedule runs. With
+                        `all` or ids: those, now, even if paused.
+      ytdl --schedule install|remove|status [--json] [--dry-run]
+                        The hourly check, registered with the operating
+                        system: a systemd user timer on Linux, a launchd
+                        agent on macOS, a Task Scheduler task on Windows.
+                        --dry-run shows what install or remove would write
+                        and run without doing it.
+
     The escape hatch:
 
       --ytdlp-arg ARG   Pass ARG straight to yt-dlp, after the config file
@@ -353,12 +412,146 @@ Usage: ytdl <youtube-url> [download-root-path] [options]
   Re-fetch:  [--refresh]         (with --mode metadata-only|comments-only|subs-only)
   Escape:    [--ytdlp-arg ARG]   (repeatable)
   Ask only:  [--probe]           (prints JSON, downloads nothing)
+  Subscribe: [--subscribe [--every Nh|Nd] [--name TEXT] [--paused]]
+
+       ytdl --subscriptions [--json]
+       ytdl --unsubscribe ID
+       ytdl --edit-subscription ID [--every Nh|Nd] [--name TEXT] [--pause|--resume]
+       ytdl --run-subscriptions [all | ID ...]
+       ytdl --schedule install|remove|status [--json] [--dry-run]
 "@
 
 $argList = @($args)
 if ($argList.Count -eq 0 -or [string]::IsNullOrWhiteSpace($argList[0])) {
     Write-Usage $usage
     exit 1
+}
+
+# --every's value: "6h" or "2d", as whole hours from 1 to 720 (30 days).
+# Returns the hours, or $null for anything else. Hours rather than a
+# freer duration syntax because the schedule is an hourly heartbeat, and a
+# "90m" that silently meant two hours would be a lie about when it runs.
+function ConvertFrom-EveryValue {
+    param([string]$Value)
+    if ($Value -notmatch '^(?i)(\d{1,4})([hd])$') { return $null }
+    $hours = [int]$Matches[1] * $(if ($Matches[2] -ieq 'd') { 24 } else { 1 })
+    if ($hours -lt 1 -or $hours -gt 720) { return $null }
+    return $hours
+}
+
+# A subscription label: shown in a list row, so one line of ordinary text.
+function Test-SubscriptionName {
+    param([string]$Value)
+    return ($Value.Trim().Length -ge 1 -and $Value.Length -le 120 -and $Value -notmatch '[\x00-\x1f\x7f]')
+}
+
+# Named parameters for subscriptions.ps1 that carry free text travel as
+# base64, for the `pwsh -File` reason given at -YtdlpArgsB64 below: a value
+# beginning with "-" reaches that script's parameter binder as a NAME.
+function ConvertTo-B64 {
+    param([string]$Text)
+    return [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
+}
+
+# --- The subscription commands, which take no URL ---
+#
+# Handled before anything else looks at the first argument, because each
+# of them IS an option in the URL's position -- the one shape the guard
+# below exists to refuse. They are their own small grammar rather than
+# cases in the main option switch for the same reason: every option in
+# that switch describes a download of the URL in front of it, and none of
+# these has a URL.
+#
+# The work is in subscriptions.ps1, started as its own process the way
+# probe.ps1 and run_ytdlp.ps1 are. Only parsing happens here, so this file
+# stays the one place a `ytdl` command line is read.
+$subscriptionCommands = @("--subscriptions", "--unsubscribe", "--edit-subscription", "--run-subscriptions", "--schedule")
+if ($subscriptionCommands -contains $argList[0]) {
+    $command = $argList[0]
+    $tail = @(if ($argList.Count -gt 1) { $argList[1..($argList.Count - 1)] } else { @() })
+    $subsScript = Join-Path $installRoot "scripts/subscriptions.ps1"
+    if (-not (Test-Path -LiteralPath $subsScript)) {
+        Write-Usage "Error: $subsScript is missing -- this install predates subscriptions. Re-run setup to install it."
+        exit 1
+    }
+    $subsArgs = @("-NoProfile", "-File", $subsScript)
+
+    if ($command -eq "--subscriptions") {
+        $wantJson = $false
+        foreach ($t in $tail) {
+            if ($t -eq "--json") { $wantJson = $true }
+            else { Write-Usage "Error: --subscriptions takes only --json (got: '$t')"; exit 1 }
+        }
+        $subsArgs += @("-Action", "list")
+        if ($wantJson) { $subsArgs += "-Json" }
+    } elseif ($command -eq "--unsubscribe") {
+        if ($tail.Count -ne 1 -or $tail[0].StartsWith("--")) {
+            Write-Usage "Error: --unsubscribe takes one subscription id (see ytdl --subscriptions)"
+            exit 1
+        }
+        $subsArgs += @("-Action", "unsubscribe", "-Id", $tail[0])
+    } elseif ($command -eq "--edit-subscription") {
+        if ($tail.Count -lt 1 -or $tail[0].StartsWith("--")) {
+            Write-Usage "Error: --edit-subscription needs a subscription id first (see ytdl --subscriptions)"
+            exit 1
+        }
+        $subsArgs += @("-Action", "edit", "-Id", $tail[0])
+        $changed = $false
+        $pause = $false; $resume = $false
+        $j = 1
+        while ($j -lt $tail.Count) {
+            $t = $tail[$j]
+            if ($t -eq "--every") {
+                if ($j + 1 -ge $tail.Count) { Write-Usage "Error: --every requires a value such as 6h or 2d"; exit 1 }
+                $h = ConvertFrom-EveryValue $tail[$j + 1]
+                if ($null -eq $h) { Write-Usage "Error: --every takes hours or days, from 1h to 30d, e.g. 6h or 2d (got: '$($tail[$j + 1])')"; exit 1 }
+                $subsArgs += @("-EveryHours", $h); $changed = $true; $j += 2
+            } elseif ($t -eq "--name") {
+                if ($j + 1 -ge $tail.Count) { Write-Usage "Error: --name requires a value"; exit 1 }
+                if (-not (Test-SubscriptionName $tail[$j + 1])) { Write-Usage "Error: --name takes one line of up to 120 characters"; exit 1 }
+                $subsArgs += @("-SetName", "-NameB64", (ConvertTo-B64 $tail[$j + 1])); $changed = $true; $j += 2
+            } elseif ($t -eq "--pause") {
+                $pause = $true; $changed = $true; $j++
+            } elseif ($t -eq "--resume") {
+                $resume = $true; $changed = $true; $j++
+            } else {
+                Write-Usage "Error: --edit-subscription takes --every, --name, --pause or --resume (got: '$t'). To change what it downloads, --subscribe the URL again with the new options."
+                exit 1
+            }
+        }
+        if ($pause -and $resume) { Write-Usage "Error: --pause and --resume contradict each other."; exit 1 }
+        if (-not $changed) { Write-Usage "Error: --edit-subscription needs --every, --name, --pause or --resume"; exit 1 }
+        if ($pause)  { $subsArgs += "-Paused" }
+        if ($resume) { $subsArgs += "-Resume" }
+    } elseif ($command -eq "--run-subscriptions") {
+        foreach ($t in $tail) {
+            if ($t.StartsWith("--")) { Write-Usage "Error: --run-subscriptions takes subscription ids or 'all' (got: '$t')"; exit 1 }
+        }
+        if ($tail -contains "all" -and $tail.Count -gt 1) {
+            Write-Usage "Error: --run-subscriptions takes 'all' or ids, not both."
+            exit 1
+        }
+        $subsArgs += @("-Action", "run")
+        if ($tail.Count -gt 0) {
+            $subsArgs += @("-IdsB64", (ConvertTo-B64 (ConvertTo-Json -Compress -InputObject @($tail))))
+        }
+    } else {
+        # --schedule
+        if ($tail.Count -lt 1 -or @("install", "remove", "status") -notcontains $tail[0]) {
+            Write-Usage "Error: --schedule takes install, remove or status"
+            exit 1
+        }
+        $verb = $tail[0]
+        $subsArgs += @("-Action", "schedule", "-ScheduleAction", $verb)
+        foreach ($t in @(if ($tail.Count -gt 1) { $tail[1..($tail.Count - 1)] } else { @() })) {
+            if ($t -eq "--json" -and $verb -eq "status") { $subsArgs += "-Json" }
+            elseif ($t -eq "--dry-run" -and $verb -ne "status") { $subsArgs += "-DryRun" }
+            else { Write-Usage "Error: --schedule $verb does not take '$t' (status takes --json; install and remove take --dry-run)"; exit 1 }
+        }
+    }
+
+    & pwsh @subsArgs
+    exit $LASTEXITCODE
 }
 
 # Every option spelling the switch below accepts. The switch still needs
@@ -372,7 +565,8 @@ $knownOptions = @("--sync", "--items", "--after", "--lazy", "--workers", "--path
                   "--no-comments", "--no-subs", "--no-thumbnail", "--no-metadata", "--no-audio", "--no-video",
                   "--refresh", "--ytdlp-arg", "--probe",
                   "--fps", "--sub-langs", "--no-chapters", "--sponsorblock-mark", "--sponsorblock-remove",
-                  "--cookies-from-browser", "--cookies", "--proxy", "--limit-rate", "--downloader")
+                  "--cookies-from-browser", "--cookies", "--proxy", "--limit-rate", "--downloader",
+                  "--subscribe", "--every", "--name", "--paused")
 
 # The accepted values for the four enumerated content options. Validated
 # HERE, at the point the user typed them, rather than left to
@@ -555,6 +749,11 @@ $cookiesFile        = ""
 $proxy              = ""
 $limitRate          = ""
 $downloader         = ""
+
+$subscribe          = $false
+$everyHours         = 0
+$subscriptionName   = $null
+$subscribePaused    = $false
 
 # Backward compatibility with the old positional form: if the first
 # remaining argument does not start with "--", treat it as the legacy
@@ -848,6 +1047,34 @@ while ($i -lt $rest.Count) {
             $i++
         }
 
+        # --- Store instead of download ---
+        "--subscribe" {
+            $subscribe = $true
+            $i++
+        }
+        "--every" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --every requires a value such as 6h or 2d"; exit 1 }
+            $everyHours = ConvertFrom-EveryValue $rest[$i + 1]
+            if ($null -eq $everyHours) {
+                Write-Usage "Error: --every takes hours or days, from 1h to 30d, e.g. 6h or 2d (got: '$($rest[$i + 1])')"
+                exit 1
+            }
+            $i += 2
+        }
+        "--name" {
+            if ($i + 1 -ge $rest.Count) { Write-Usage "Error: --name requires a value"; exit 1 }
+            $subscriptionName = $rest[$i + 1]
+            if (-not (Test-SubscriptionName $subscriptionName)) {
+                Write-Usage "Error: --name takes one line of up to 120 characters"
+                exit 1
+            }
+            $i += 2
+        }
+        "--paused" {
+            $subscribePaused = $true
+            $i++
+        }
+
         default {
             Write-Usage "Unknown option: $($rest[$i])`n$usage"
             exit 1
@@ -980,6 +1207,26 @@ if ($limitRate -and $workers -and [int]$workers -gt 1) {
     Write-Usage "Note: --limit-rate applies to each of the $workers workers separately, so the session as a whole can use up to $workers times $limitRate."
 }
 
+# --- --subscribe's own contract ---
+# The three subscription details on their own would be silently ignored by
+# a download, which reads like they had been stored.
+if (-not $subscribe -and ($everyHours -gt 0 -or $null -ne $subscriptionName -or $subscribePaused)) {
+    Write-Usage "Error: --every, --name and --paused describe a subscription, and only apply with --subscribe."
+    exit 1
+}
+if ($subscribe -and $probe) {
+    Write-Usage "Error: --subscribe and --probe contradict each other: a probe downloads nothing, so there is nothing to repeat."
+    exit 1
+}
+# --refresh re-fetches a component into videos that are ALREADY archived.
+# As a subscription it would do that to every video in the listing on
+# every check -- hours of comment fetching, hourly, for a channel -- which
+# is never what someone subscribing to a channel means.
+if ($subscribe -and $refresh) {
+    Write-Usage "Error: --subscribe cannot store --refresh: it would re-fetch into every archived video on every check. Run the refresh once, by hand."
+    exit 1
+}
+
 # --audio-codec only reaches yt-dlp in audio-only mode (it drives the
 # audio-extraction postprocessor, which only runs there). Warned about
 # rather than rejected: it is a no-op, not a wrong result.
@@ -1067,6 +1314,80 @@ if ($probe) {
     exit $LASTEXITCODE
 }
 
+# --- --subscribe stores the command line instead of running it ---
+#
+# Everything above has already run: every option was validated, every
+# contradiction refused, the aliases resolved and the cookie path made
+# absolute. What is stored is therefore a command line this parser has
+# accepted, rebuilt from the PARSED values rather than copied from what
+# was typed -- so "--no-audio" is stored as "--mode video-only", a
+# relative --cookies path as an absolute one, and --audio-codec not at all
+# when the warning above dropped it. The runner hands the stored options
+# back to this file on every check, so they are validated again then too.
+#
+# --path is stored apart from the options, as the data root, resolved to
+# an absolute path NOW: the schedule runs with whatever working directory
+# the operating system gives it, and a relative path typed at a prompt
+# would mean somewhere else at 3am.
+#
+# 020-launcher asserts that every download option in $knownOptions is
+# carried here (or deliberately excluded), so an option added to the
+# switch without a line here fails the suite instead of being silently
+# dropped from every subscription that uses it.
+function Get-SubscriptionOptions {
+    $o = @()
+    if ($breakOnExisting)    { $o += "--sync" }
+    if ($playlistItems)      { $o += @("--items", $playlistItems) }
+    if ($dateAfter)          { $o += @("--after", $dateAfter) }
+    if ($lazyPlaylist)       { $o += "--lazy" }
+    if ($workers)            { $o += @("--workers", $workers) }
+    if ($noPot)              { $o += "--no-pot" }
+    if ($skipPotUpdate)      { $o += "--skip-pot-update" }
+    if ($potPort)            { $o += @("--pot-port", $potPort) }
+    if ($mode)               { $o += @("--mode", $mode) }
+    if ($quality)            { $o += @("--quality", $quality) }
+    if ($codec)              { $o += @("--codec", $codec) }
+    if ($audioCodec)         { $o += @("--audio-codec", $audioCodec) }
+    if ($container)          { $o += @("--container", $container) }
+    if ($fps)                { $o += @("--fps", $fps) }
+    if ($subLangs)           { $o += @("--sub-langs", $subLangs) }
+    if ($noChapters)         { $o += "--no-chapters" }
+    if ($sponsorMark)        { $o += @("--sponsorblock-mark", $sponsorMark) }
+    if ($sponsorRemove)      { $o += @("--sponsorblock-remove", $sponsorRemove) }
+    if ($noComments)         { $o += "--no-comments" }
+    if ($noSubs)             { $o += "--no-subs" }
+    if ($noThumbnail)        { $o += "--no-thumbnail" }
+    if ($noMetadata)         { $o += "--no-metadata" }
+    if ($cookiesFromBrowser) { $o += @("--cookies-from-browser", $cookiesFromBrowser) }
+    if ($cookiesFile)        { $o += @("--cookies", $cookiesFile) }
+    if ($proxy)              { $o += @("--proxy", $proxy) }
+    if ($limitRate)          { $o += @("--limit-rate", $limitRate) }
+    if ($downloader)         { $o += @("--downloader", $downloader) }
+    foreach ($a in $ytdlpArgs) { $o += @("--ytdlp-arg", $a) }
+    return ,$o
+}
+
+if ($subscribe) {
+    $subsScript = Join-Path $installRoot "scripts/subscriptions.ps1"
+    if (-not (Test-Path -LiteralPath $subsScript)) {
+        Write-Usage "Error: $subsScript is missing -- this install predates subscriptions. Re-run setup to install it."
+        exit 1
+    }
+    if (-not $breakOnExisting) {
+        Write-Usage "Note: without --sync, every check walks the whole listing to find what is new. For a channel's /videos page, which is newest first, --sync stops at the first video already archived."
+    }
+    $subOptions = Get-SubscriptionOptions
+    $subsArgs = @("-NoProfile", "-File", $subsScript, "-Action", "subscribe",
+                  "-UrlB64", (ConvertTo-B64 $url),
+                  "-OptionsB64", (ConvertTo-B64 (ConvertTo-Json -Compress -InputObject @($subOptions))))
+    if ($customPath)      { $subsArgs += @("-DataRoot", [System.IO.Path]::GetFullPath($customPath)) }
+    if ($everyHours -gt 0) { $subsArgs += @("-EveryHours", $everyHours) }
+    if ($null -ne $subscriptionName) { $subsArgs += @("-SetName", "-NameB64", (ConvertTo-B64 $subscriptionName)) }
+    if ($subscribePaused) { $subsArgs += "-Paused" }
+    & pwsh @subsArgs
+    exit $LASTEXITCODE
+}
+
 # Assembled as an argument ARRAY rather than a command string, so a path or
 # URL containing spaces never needs quoting logic here at all -- pwsh
 # passes each element through as a single argument regardless of content.
@@ -1103,6 +1424,20 @@ if ($cookiesFile)        { $pwshArgs += @("-CookiesFile", $cookiesFile) }
 if ($proxy)              { $pwshArgs += @("-Proxy", $proxy) }
 if ($limitRate)          { $pwshArgs += @("-LimitRate", $limitRate) }
 if ($downloader)         { $pwshArgs += @("-Downloader", $downloader) }
+
+# The session log's name, when a subscription check started this run. Set
+# by subscriptions.ps1 in the environment of the ytdl it starts, rather
+# than as an option, because it is not a choice anybody makes: it keeps a
+# scheduled session's lines out of download.log, where a manual session
+# running at the same time would otherwise find them in the middle of its
+# own video_complete.log. run_ytdlp.ps1 validates the shape again.
+if ($env:YTDL_SESSION_LOG) {
+    if ($env:YTDL_SESSION_LOG -notmatch '^download\.[A-Za-z0-9_-]+\.log$') {
+        Write-Usage "Error: YTDL_SESSION_LOG must be a file name like download.something.log (got: '$($env:YTDL_SESSION_LOG)')"
+        exit 1
+    }
+    $pwshArgs += @("-SessionLog", $env:YTDL_SESSION_LOG)
+}
 
 # --- Passing an ARRAY across `pwsh -File`, which cannot be done directly ---
 # This is the same boundary problem setup-common.ps1 documents for

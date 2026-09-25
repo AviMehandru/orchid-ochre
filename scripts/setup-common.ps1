@@ -405,6 +405,7 @@ $ProjectFiles = @(
     "scripts/postprocess.ps1",
     "scripts/ytdl.ps1",
     "scripts/probe.ps1",
+    "scripts/subscriptions.ps1",
     "scripts/pot-provider.ps1",
     "scripts/archive-viewer.py",
     "config/yt-dlp.conf",
@@ -519,6 +520,13 @@ Install-ProjectFile -RepoPath "scripts/ytdl.ps1"          -Destination (Join-Pat
 # calls, and only a new phase of work would earn an increment of
 # TOTAL_STEPS.
 Install-ProjectFile -RepoPath "scripts/probe.ps1"         -Destination (Join-Path $ScriptsDir "probe.ps1")         -Label "probe.ps1"
+# subscriptions.ps1 is `ytdl --subscribe` and the other subscription
+# commands, launched by ytdl.ps1 the same way. Installing it does NOT turn
+# on the hourly schedule: that registers a job with the operating system,
+# which an installer should not do behind anybody's back -- and setup can be
+# run non-interactively by an app's installer, where nobody would see it
+# happen. `ytdl --schedule install` is the one deliberate step.
+Install-ProjectFile -RepoPath "scripts/subscriptions.ps1" -Destination (Join-Path $ScriptsDir "subscriptions.ps1") -Label "subscriptions.ps1"
 # pot-provider.ps1 is dot-sourced by run_ytdlp.ps1 rather than launched, so
 # it needs no PATH entry and no launcher -- but it must land in the same
 # ScriptsDir, because that is the only place run_ytdlp.ps1 looks for it.
